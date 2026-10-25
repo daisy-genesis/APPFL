@@ -108,6 +108,13 @@ class AgentConfig:
         skip_radius: how close a candidate must be to a reported input to be skipped. ``0``
             means the same input; with ``token_noise`` the reported input has moved, so this
             should cover the noise.
+        input_hops: how far a reported input travels. ``1`` is v2: an agent hears only its
+            in-neighbours' own inputs, so the filter cannot see what anyone further away ran,
+            while claims and verdicts are relayed several hops. ``h > 1`` has each token also
+            carry the inputs its sender heard at fewer than ``h`` hops in the previous round,
+            for the filter only -- not the peer field, trust, novelty or the planner -- so the
+            arm changes nothing but the filter's reach. Costs 8 bits a coordinate per relayed
+            input; needs ``skip_peer_inputs``.
         hit_threshold: the score that makes an outcome a hit, for the hit tests and what the
             planner is told. ``None`` leaves hits undefined.
         share_hits: verdicts carry what the campaign found (hits, new hit families, best score)
@@ -141,6 +148,7 @@ class AgentConfig:
     token_noise: float = 0.0
     skip_peer_inputs: bool = False
     skip_radius: float = 0.0
+    input_hops: int = 1
     hit_threshold: Optional[float] = None
     share_hits: bool = False
     share_detail: bool = False
@@ -182,6 +190,9 @@ class ADKOHAgent:
         self.surrogate = surrogate
         self.problem = problem
         self.cfg = cfg or AgentConfig()
+        if self.cfg.input_hops > 1 and not self.cfg.skip_peer_inputs:
+            raise ValueError("input_hops > 1 relays inputs only the peer-input filter reads; "
+                             "set skip_peer_inputs too, or the relay costs bits for nothing")
         self.space = problem.region_space
         self.planner = planner
         self.quantizer = Quantizer(self.cfg.q_bits)
@@ -222,6 +233,12 @@ class ADKOHAgent:
         self._peer_X: List[np.ndarray] = []
         self._peer_desc: List[np.ndarray] = []
         self._peer_fams: set = set()
+        # Inputs relayed from beyond the in-neighbours (``input_hops > 1``), kept apart from
+        # ``_peer_X`` so that only the filter reads them; what this agent will relay next
+        # round; and every input it has already taken in, so nothing is stored or relayed twice.
+        self._relayed_X: List[np.ndarray] = []
+        self._relay_out: List[Dict[str, Any]] = []
+        self._seen_inputs: set = set()
         self.diag: Dict[str, Any] = {}
         self.records: List[Dict[str, Any]] = []
         #: History entries that came from shared initial data rather than from this run's
@@ -461,7 +478,7 @@ class ADKOHAgent:
         exclude = sorted(self._keys | {int(k) for k in taken})
         cands = self.problem.pool(self.rng, self.cfg.pool_size, exclude, region)
         skipped = 0
-        if self.cfg.skip_peer_inputs and self._peer_X:
+        if self.cfg.skip_peer_inputs and (self._peer_X or self._relayed_X):
             cands, skipped = self._skip_reported(cands, exclude, region)
         self._cands = cands
         if len(cands) == 0:
@@ -490,7 +507,7 @@ class ADKOHAgent:
         neighbours have mined out leaves a smaller pool rather than a stall -- and if nothing at
         all is left, the original draw stands.
         """
-        known = np.asarray(self._peer_X, dtype=float)
+        known = np.asarray(self._peer_X + self._relayed_X, dtype=float)
         tol = max(float(self.cfg.skip_radius), 1e-9)
         ok = hrules.nearest_distance(cands.X, known) > tol
         skipped = int(np.count_nonzero(~ok))
@@ -612,6 +629,10 @@ class ADKOHAgent:
         x_shared = self.problem.privatize(pick.X, self.token_rng)
         if self.cfg.token_noise > 0:
             x_shared = self._jitter(x_shared)
+        relayed: List[Dict[str, Any]] = []
+        if self.cfg.input_hops > 1:
+            self._seen_inputs.add(_input_key(x_shared))  # my own run, if it comes back to me
+            relayed, self._relay_out = self._relay_out, []
         tok = encode(
             agent_id=self.agent_id,
             source=self.index,
@@ -626,6 +647,7 @@ class ADKOHAgent:
             family=out.family if self.cfg.share_family else "",
             claims=claims_out,
             verdicts=verdicts_out,
+            relayed=relayed,
         )
         self.records.append(
             {
@@ -748,6 +770,8 @@ class ADKOHAgent:
         self.memory.prune()
         for t in peers:
             self._peer_X.append(np.asarray(t.x, dtype=float))
+            if self.cfg.input_hops > 1:
+                self._take_relay(t)
             z = np.asarray(getattr(t, "descriptor", []), dtype=float)
             if z.size and self.descriptor_scale is not None and z.size == len(self.descriptor_scale):
                 self._peer_desc.append(z * self.descriptor_scale)
@@ -759,6 +783,22 @@ class ADKOHAgent:
                 [c for t in peers for c in getattr(t, "claims", [])],
                 [v for t in peers for v in getattr(t, "verdicts", [])],
             )
+
+    def _take_relay(self, t: HToken) -> None:
+        """Note a neighbour's input and the inputs it relayed; queue what may travel further."""
+        hops = self.cfg.input_hops
+        direct = _input_key(t.x)
+        if direct not in self._seen_inputs:
+            self._seen_inputs.add(direct)
+            self._relay_out.append({"h": 1, "x": list(t.x)})
+        for r in getattr(t, "relayed", []):
+            k = _input_key(r["x"])
+            if k in self._seen_inputs:
+                continue
+            self._seen_inputs.add(k)
+            self._relayed_X.append(np.asarray(r["x"], dtype=float))
+            if int(r["h"]) + 1 < hops:
+                self._relay_out.append({"h": int(r["h"]) + 1, "x": list(r["x"])})
 
     def _update_trust(self, tokens: Sequence[HToken]) -> None:
         mu, sd = self.surrogate.predict(np.asarray([t.x for t in tokens], dtype=float))
@@ -801,7 +841,14 @@ class ADKOHAgent:
             "claims": dict(self.claims.totals),
             "trust": None if self.trust is None else self.trust.snapshot(),
             "records": self.records,
+            **({"relayed_inputs": len(self._relayed_X)} if self.cfg.input_hops > 1 else {}),
         }
+
+
+def _input_key(x) -> Tuple[float, ...]:
+    """An input as a hashable value. Relays copy the reported coordinates exactly, so two copies
+    of one run compare equal and two different runs (noise included) do not."""
+    return tuple(float(v) for v in np.asarray(x, dtype=float).ravel())
 
 
 def _take(c: Candidates, mask: np.ndarray) -> Candidates:

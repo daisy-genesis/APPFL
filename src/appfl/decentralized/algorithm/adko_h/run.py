@@ -136,6 +136,9 @@ def parse(argv=None) -> argparse.Namespace:
     g.add_argument("--skip-radius", type=float, default=0.0,
                    help="distance within which a candidate counts as reported (0: the same "
                         "input); with --token-noise it should cover the noise")
+    g.add_argument("--input-hops", type=int, default=1,
+                   help="how far a reported input travels for --skip-peer-inputs: 1 is v2 "
+                        "(in-neighbours only); h > 1 relays inputs heard at fewer than h hops")
     g.add_argument("--verbose", action="store_true")
 
     g = p.add_argument_group("planner")
@@ -295,6 +298,7 @@ def main(argv=None) -> int:
                 force_rule=args.rule,
                 skip_peer_inputs=args.skip_peer_inputs,
                 skip_radius=args.skip_radius,
+                input_hops=args.input_hops,
                 hit_threshold=args.hit_threshold,
                 **arm,
             ),

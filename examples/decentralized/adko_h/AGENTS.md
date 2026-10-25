@@ -60,7 +60,9 @@ Two switches apply to any arm. `--skip-peer-inputs` leaves out candidates a neig
 shows were already run (agents otherwise re-run each other's experiments). `--token-noise`
 adds Gaussian noise to the input a token carries, in units of each coordinate's spread (v2's
 continuous channel is 0.17); with it, give `--skip-radius` a distance that covers the noise,
-since an exact match no longer happens. `--share-detail` widens the campaign channel to prose:
+since an exact match no longer happens. Inputs travel one hop, so the filter sees only
+in-neighbours' runs; `--input-hops 2` has each token also relay the inputs its sender heard
+last round (8 bits a coordinate each), for the filter only. `--share-detail` widens the campaign channel to prose:
 the full hypothesis instead of a truncation, one sentence the planner is asked to write for its
 neighbours (a `note` field in the same call, so it costs output tokens and not a second
 request), and the box a campaign's hits fell in. It raises bits per token by a few hundred,

@@ -54,12 +54,18 @@ def quantize_descriptor(z: Sequence[float], scale: Sequence[float]) -> List[floa
 
 @dataclass
 class HToken(KnowledgeToken):
-    """``{x, q, z, flag}`` plus ``descriptor``, ``family``, ``claims`` and ``verdicts``."""
+    """``{x, q, z, flag}`` plus ``descriptor``, ``family``, ``claims`` and ``verdicts``.
+
+    ``relayed`` carries other agents' reported inputs one hop further, each as
+    ``{"h": hops travelled so far, "x": the input as its owner's token reported it}``. Only the
+    peer-input filter reads them; it is empty unless the arm sets ``input_hops`` above one.
+    """
 
     descriptor: List[float] = field(default_factory=list)
     family: str = ""
     claims: List[Claim] = field(default_factory=list)
     verdicts: List[Verdict] = field(default_factory=list)
+    relayed: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -80,16 +86,19 @@ class HToken(KnowledgeToken):
             family=str(d.get("family", "")),
             claims=[Claim(**c) for c in d.get("claims", [])],
             verdicts=[Verdict(**v) for v in d.get("verdicts", [])],
+            relayed=[{"h": int(r["h"]), "x": list(r["x"])} for r in d.get("relayed", [])],
         )
 
     def payload_bits(self) -> int:
         """The method's own payload, as the paper counts it, not the JSON envelope.
 
         ``len(x)`` inputs and each descriptor component at 8 bits, 8 for ``q``, 1 for the flag,
-        and the text and campaign messages at one byte per character. What ``size_bits``
-        reports stays the JSON length, so budgets remain comparable with v1 and v2.
+        the text and campaign messages at one byte per character, and each relayed input at
+        8 bits a coordinate plus 8 for its hop count. What ``size_bits`` reports stays the JSON
+        length, so budgets remain comparable with v1 and v2.
         """
         bits = 8 * (len(self.x) + len(self.descriptor)) + 8 + 1
+        bits += sum(8 * len(r["x"]) + 8 for r in self.relayed)
         bits += 8 * len(self.insight or "") + 8 * len(self.family)
         for m in list(self.claims) + list(self.verdicts):
             bits += 8 * len(json.dumps(m if isinstance(m, dict) else m.to_dict(), separators=(",", ":")))
@@ -111,6 +120,7 @@ def encode(
     family: str = "",
     claims: Sequence[Claim] = (),
     verdicts: Sequence[Verdict] = (),
+    relayed: Sequence[Dict[str, Any]] = (),
 ) -> HToken:
     """One result and this round's campaign messages in, one token out.
 
@@ -130,4 +140,5 @@ def encode(
         family=str(family or ""),
         claims=list(claims),
         verdicts=list(verdicts),
+        relayed=[{"h": int(r["h"]), "x": list(r["x"])} for r in relayed],
     )

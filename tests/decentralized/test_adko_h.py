@@ -912,6 +912,94 @@ class TestSkipAndNoise(unittest.TestCase):
         np.testing.assert_array_equal(tb.x, pb.X)
 
 
+class TestInputRelay(unittest.TestCase):
+    """``input_hops``: reported inputs travel past the in-neighbours, for the filter only."""
+
+    def node(self, i, **kw):
+        from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
+
+        self.problem = FixedPool()
+        cfg = AgentConfig(pool_size=16, warmup_rounds=0, skip_peer_inputs=True, **kw)
+        return ADKOHAgent(f"Agent{i}", i, GP(), self.problem, cfg, neighbor_indices=[i + 1], degree=1)
+
+    def token(self, i, x, rnd=0, relayed=()):
+        return encode(agent_id=f"Agent{i}", source=i, round=rnd, x_shared=list(x), u=0.5,
+                      history=[0.5], quantizer=Quantizer(8), relayed=relayed)
+
+    def step(self, a, rnd):
+        pick = a.propose(rnd)
+        return a.complete(pick, self.problem.evaluate([pick])[0], rnd)
+
+    def test_off_by_default_and_costs_nothing(self):
+        a = self.node(1)
+        a.observe([self.token(2, self.problem.X[5])])
+        tok = self.step(a, 1)
+        self.assertEqual(tok.relayed, [])
+        self.assertEqual(tok.payload_bits(), self.token(1, tok.x).payload_bits())
+
+    def test_two_hops_reach_the_filter_and_stop_there(self):
+        b = self.node(1, input_hops=2)
+        b.observe([self.token(2, self.problem.X[5])])  # Agent2 ran point 5; Agent0 cannot hear it
+        tb = self.step(b, 1)
+        self.assertEqual(tb.relayed, [{"h": 1, "x": list(self.problem.X[5])}])
+        self.assertEqual(tb.payload_bits() - self.token(1, tb.x).payload_bits(), 8 * 2 + 8)
+        a = self.node(0, input_hops=2)
+        a.observe([tb])
+        a.propose(2)
+        self.assertNotIn(5, set(a._cands.key))
+        self.assertEqual(len(a._relayed_X), 1)
+        ta = self.step(a, 2)
+        self.assertNotIn(list(self.problem.X[5]), [r["x"] for r in ta.relayed])  # 2 hops is all
+
+    def test_three_hops_relay_once_more(self):
+        a = self.node(0, input_hops=3)
+        a.observe([self.token(1, self.problem.X[1], relayed=[{"h": 1, "x": list(self.problem.X[5])}])])
+        ta = self.step(a, 1)
+        self.assertIn({"h": 2, "x": list(self.problem.X[5])}, ta.relayed)
+
+    def test_relayed_inputs_feed_only_the_filter(self):
+        a = self.node(0, input_hops=2)
+        a.observe([self.token(1, self.problem.X[1], relayed=[{"h": 1, "x": list(self.problem.X[5])}])])
+        self.assertEqual(len(a._peer_X), 1)
+        self.assertEqual(len(a._known_inputs()), 1)
+        self.assertEqual(len(a.memory.X), 1)
+
+    def test_one_run_heard_twice_is_kept_once_and_my_own_is_not_kept(self):
+        a = self.node(0, input_hops=2)
+        mine = self.step(a, 0)
+        x5 = {"h": 1, "x": list(self.problem.X[5])}
+        back = {"h": 1, "x": list(mine.x)}
+        a.observe([self.token(1, self.problem.X[1], 1, relayed=[x5, back]),
+                   self.token(2, self.problem.X[2], 1, relayed=[x5])])
+        self.assertEqual(len(a._relayed_X), 1)
+
+    def test_relaying_without_the_filter_is_refused(self):
+        from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
+
+        with self.assertRaises(ValueError):
+            ADKOHAgent("Agent0", 0, GP(), FixedPool(), AgentConfig(input_hops=2),
+                       neighbor_indices=[1], degree=1)
+
+    def test_a_run_with_relay(self):
+        import json
+        import tempfile
+
+        def go(hops, out=None):
+            cfg = RunConfig(
+                rounds=10, agents=6, seed=0, topology="random_regular",
+                topology_kwargs={"k": 2, "seed": 0}, planner="none", start_points=6,
+                agent_cfg=AgentConfig(warmup_rounds=2, pool_size=64, skip_peer_inputs=True,
+                                      skip_radius=1e-6, input_hops=hops),
+            )
+            return run(Synthetic(seed=0), GP, cfg, out=out)
+
+        with tempfile.TemporaryDirectory() as d:
+            rec = go(2, d)
+            agents = json.loads((Path(d) / "run.json").read_text())["agents"]
+        self.assertTrue(all(a["relayed_inputs"] > 0 for a in agents))
+        self.assertGreater(rec["bits_per_token"], go(1)["bits_per_token"])
+
+
 class TestPromptV2(unittest.TestCase):
     def ctx(self, **kw):
         from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
