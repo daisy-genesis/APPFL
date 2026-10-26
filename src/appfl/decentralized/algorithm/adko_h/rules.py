@@ -129,6 +129,28 @@ def adjust(
     return v, parts
 
 
+def biweight(d: np.ndarray, radius: float) -> np.ndarray:
+    """``(1 - (d / radius)^2)^2`` inside ``radius``, 0 outside: 1 at distance 0, smooth to 0."""
+    u = np.clip(np.asarray(d, dtype=float) / float(radius), 0.0, 1.0)
+    return (1.0 - u ** 2) ** 2
+
+
+def discount(v: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Keep ``1 - k`` of each value's height above the pool's lowest finite value.
+
+    ``k = 0`` leaves a value alone and ``k = 1`` drops it to the floor, so the transform works
+    for values of either sign and never reorders candidates with the same ``k``.
+    """
+    v = np.asarray(v, dtype=float)
+    fin = np.isfinite(v)
+    if not fin.any():
+        return v.copy()
+    lo = float(np.min(v[fin]))
+    out = v.copy()
+    out[fin] = lo + (1.0 - np.broadcast_to(np.asarray(k, dtype=float), v.shape)[fin]) * (v[fin] - lo)
+    return out
+
+
 def pick(v: np.ndarray, mask: Optional[np.ndarray] = None) -> int:
     """Index of the best candidate, inside ``mask`` when one is given.
 

@@ -115,6 +115,14 @@ class AgentConfig:
             for the filter only -- not the peer field, trust, novelty or the planner -- so the
             arm changes nothing but the filter's reach. Costs 8 bits a coordinate per relayed
             input; needs ``skip_peer_inputs``.
+        soft_radius: a soft ring around the hard filter. A candidate between ``skip_radius``
+            and ``soft_radius`` of a reported input keeps only part of its value above the
+            pool's lowest: ``v' = v_lo + (1 - K(d)) (v - v_lo)``, with the biweight
+            ``K(d) = (1 - (d / soft_radius)^2)^2`` for ``d < soft_radius`` (1 at the report, 0 at
+            the radius). Near-repeats of what others ran are discouraged, not forbidden: a
+            candidate the rule rates far above the rest can still win. ``0`` turns it off;
+            needs ``skip_peer_inputs``, whose hard ``skip_radius`` still removes the reported
+            input itself.
         hit_threshold: the score that makes an outcome a hit, for the hit tests and what the
             planner is told. ``None`` leaves hits undefined.
         share_hits: verdicts carry what the campaign found (hits, new hit families, best score)
@@ -149,6 +157,7 @@ class AgentConfig:
     skip_peer_inputs: bool = False
     skip_radius: float = 0.0
     input_hops: int = 1
+    soft_radius: float = 0.0
     hit_threshold: Optional[float] = None
     share_hits: bool = False
     share_detail: bool = False
@@ -193,6 +202,9 @@ class ADKOHAgent:
         if self.cfg.input_hops > 1 and not self.cfg.skip_peer_inputs:
             raise ValueError("input_hops > 1 relays inputs only the peer-input filter reads; "
                              "set skip_peer_inputs too, or the relay costs bits for nothing")
+        if self.cfg.soft_radius > 0 and not self.cfg.skip_peer_inputs:
+            raise ValueError("soft_radius discounts candidates near reported inputs, which only "
+                             "skip_peer_inputs keeps; set it too")
         self.space = problem.region_space
         self.planner = planner
         self.quantizer = Quantizer(self.cfg.q_bits)
@@ -547,6 +559,12 @@ class ADKOHAgent:
             novelty=nov,
             novelty_weight=self.cfg.novelty_weight,
         )
+        soft = None
+        if self.cfg.soft_radius > 0 and (self._peer_X or self._relayed_X):
+            known = np.asarray(self._peer_X + self._relayed_X, dtype=float)
+            soft = hrules.biweight(hrules.nearest_distance(cands.X, known), self.cfg.soft_radius)
+            hard = hrules.pick(v, mask)
+            v = hrules.discount(v, soft)
         i = hrules.pick(v, mask)
         self.diag = {
             "mode": "campaign",
@@ -558,6 +576,11 @@ class ADKOHAgent:
             "spent": c.spent,
             "budget": c.budget,
             "steered": float(np.mean(pen)) if pen is not None else 0.0,
+            **(
+                {"soft": round(float(np.mean(soft)), 6), "soft_moved": bool(i != hard)}
+                if soft is not None
+                else {}
+            ),
             "score_baseline": bool(
                 i == hrules.pick(score(mu, sigma, G, L, w.beta, w.lam, w.gamma), None)
             ),

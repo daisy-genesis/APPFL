@@ -1000,6 +1000,59 @@ class TestInputRelay(unittest.TestCase):
         self.assertGreater(rec["bits_per_token"], go(1)["bits_per_token"])
 
 
+class TestSoftFilter(unittest.TestCase):
+    """``soft_radius``: candidates near a reported input are discounted, not dropped."""
+
+    def test_biweight_is_one_at_the_report_and_zero_at_the_radius(self):
+        from appfl.decentralized.algorithm.adko_h import rules
+
+        k = rules.biweight(np.array([0.0, 0.4, 0.8, 1.2]), 0.8)
+        np.testing.assert_allclose(k, [1.0, 0.5625, 0.0, 0.0])
+
+    def test_discount_keeps_order_and_moves_the_pick_off_a_near_repeat(self):
+        from appfl.decentralized.algorithm.adko_h import rules
+
+        v = np.array([-1.0, 0.0, 2.0, 3.0])
+        np.testing.assert_allclose(rules.discount(v, np.zeros(4)), v)
+        out = rules.discount(v, np.array([0.0, 0.0, 0.0, 0.75]))
+        np.testing.assert_allclose(out, [-1.0, 0.0, 2.0, 0.0])
+        self.assertEqual(int(np.argmax(out)), 2)
+        self.assertTrue(np.isneginf(rules.discount(np.array([-np.inf, 1.0]), np.ones(2))[0]))
+
+    def test_off_by_default_and_refused_without_the_filter(self):
+        from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
+
+        self.assertEqual(AgentConfig().soft_radius, 0.0)
+        with self.assertRaises(ValueError):
+            ADKOHAgent("Agent0", 0, GP(), FixedPool(), AgentConfig(soft_radius=0.5),
+                       neighbor_indices=[1], degree=1)
+
+    def test_a_run_with_the_soft_ring(self):
+        import json
+        import tempfile
+
+        def go(soft, out=None):
+            cfg = RunConfig(
+                rounds=12, agents=6, seed=0, topology="random_regular",
+                topology_kwargs={"k": 2, "seed": 0}, planner="none", start_points=6,
+                agent_cfg=AgentConfig(warmup_rounds=2, pool_size=64, skip_peer_inputs=True,
+                                      skip_radius=1e-6, soft_radius=soft),
+            )
+            return run(Synthetic(seed=0), GP, cfg, out=out)
+
+        with tempfile.TemporaryDirectory() as d:
+            go(0.5, d)
+            recs = [r for a in json.loads((Path(d) / "run.json").read_text())["agents"] for r in a["records"]]
+        soft = [r for r in recs if "d_soft" in r]
+        self.assertTrue(soft)
+        self.assertTrue(all(0.0 <= r["d_soft"] <= 1.0 for r in soft))
+        self.assertTrue(any(r["d_soft_moved"] for r in soft))
+        with tempfile.TemporaryDirectory() as d:
+            go(0.0, d)
+            recs0 = [r for a in json.loads((Path(d) / "run.json").read_text())["agents"] for r in a["records"]]
+        self.assertFalse(any("d_soft" in r for r in recs0))
+
+
 class TestPromptV2(unittest.TestCase):
     def ctx(self, **kw):
         from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
