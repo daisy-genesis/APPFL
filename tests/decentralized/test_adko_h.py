@@ -1320,5 +1320,810 @@ class TestPMO(unittest.TestCase):
         self.assertTrue(np.all(s > 0))
 
 
+
+# -- agency (design 2026-11-11, items A0-A12) ----------------------------------------------------
+
+from appfl.decentralized.algorithm.adko_h.problem import Outcome, Pick  # noqa: E402
+from appfl.decentralized.algorithm.adko_h.signals import SURPRISE_KINDS  # noqa: E402
+
+#: Signals as the harness would send them: a surprise, a settled match, a pending result.
+SURPRISE = {"settled": True, "stable": True, "observed": "P1", "predicted": "W1-X", "mismatch": True,
+            "kind": "wetting_absent", "outside_nine": False, "novelty": 0.8, "surprise": True}
+MATCH = {"settled": True, "stable": True, "observed": "W1-X", "predicted": "W1-X", "mismatch": False,
+         "kind": None, "outside_nine": False, "novelty": 0.1, "surprise": False}
+PENDING = {"settled": False, "stable": None, "observed": "P1", "predicted": "W1-X", "mismatch": None,
+           "kind": None, "outside_nine": None, "novelty": 5.0, "surprise": False}
+
+
+class SignalSynthetic(Synthetic):
+    """The synthetic problem with signals: a crude predictor (``alpha`` below x1 = 0.5, ``beta``
+    above), so mismatches and surprises occur, and some results pending (x5 above 0.85). It
+    also names a target, a role per agent, its classes, and any rules a test gives it."""
+
+    CLASSES = ("alpha", "beta", "gamma", "delta", "epsilon", "background")
+
+    def __init__(self, seed: int = 0, fns=None):
+        super().__init__(seed=seed)
+        self.fns = dict(fns or {})
+
+    def evaluate(self, picks):
+        outs = super().evaluate(picks)
+        for p, o in zip(picks, outs):
+            x = np.asarray(p.X, dtype=float)
+            pred, pend = ("alpha" if x[0] < 0.5 else "beta"), bool(x[4] > 0.85)
+            kind = None
+            if o.family != pred:
+                kind = "under_demixed" if o.family == "background" else (
+                    "over_demixed" if x[2] > 0.5 else "wetting_absent")
+            o.signals = {"settled": not pend, "stable": True, "observed": o.family, "predicted": pred,
+                         "mismatch": None if pend else o.family != pred, "kind": kind,
+                         "novelty": round(float(x[3]), 4),
+                         "surprise": (not pend) and kind in SURPRISE_KINDS}
+        return outs
+
+    def describe(self):
+        d = super().describe()
+        d.update(target="Each laboratory scores a result 1 when its observed class differs from the "
+                        "predicted one.", role=["hunt wetting changes", "hunt extra phases"],
+                 classes=list(self.CLASSES), rule_notes={"lowx1": "the smallest x1 in the region"})
+        return d
+
+    def rules(self):
+        return dict(self.fns)
+
+
+def agency(problem=None, index=0, start=0, **kw):
+    """One agent on the signal problem with a planner attached (so it plans) and no warmup;
+    ``start`` shared initial points loaded first, so its GP is fitted."""
+    from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
+
+    problem = problem or SignalSynthetic(seed=0)
+    kw.setdefault("budget_range", (2, 10))
+    cfg = AgentConfig(warmup_rounds=0, pool_size=32, claim_weight=0.0, **kw)
+    a = ADKOHAgent(f"Agent{index}", index, GP(), problem, cfg, neighbor_indices=[1 - index],
+                   degree=1, planner=object())
+    if start:
+        c = problem.start(0, start)
+        a.load(c, problem.evaluate([Pick(agent=-1, key=int(k), X=c.X[i], F=c.F[i])
+                                    for i, k in enumerate(c.key)]))
+    return a
+
+
+def step(a, rnd, sig=None, score=0.5, family="alpha"):
+    """One pick and its result, with the signals the test wants."""
+    pick = a.propose(rnd)
+    out = Outcome(score=score, descriptor=np.asarray(pick.X[:3], dtype=float), family=family,
+                  signals=dict(sig or {}))
+    return pick, a.complete(pick, out, rnd)
+
+
+def design(sp, budget=5, rule="explore", **kw):
+    """A legacy design: one region, one rule, one budget."""
+    return {"region": sp.full(), "rule": rule, "budget": budget, "hypothesis": "h",
+            "test": Test("mismatches", ">=", 1.0), "p_success": 0.5, "source": "test", **kw}
+
+
+def parts_design(sp, parts, **kw):
+    """A version-3 design: ``parts`` as (bounds, rule, n[, anchor])."""
+    rows = [{"region": sp.region(bounds=b), "rule": r, "n": n, "anchor": (rest[0] if rest else None)}
+            for b, r, n, *rest in parts]
+    return {"parts": rows, "hypothesis": "h", "test": Test("mismatches", ">=", 1.0),
+            "p_success": 0.5, "source": "test", **kw}
+
+
+class TestAgencyDefaults(unittest.TestCase):
+    """A0: with every new field at its default, nothing an earlier arm produced changes."""
+
+    def test_new_fields_default_off(self):
+        c = AgentConfig()
+        self.assertEqual(
+            (c.parts, c.replan_on_surprise, c.followup, c.anchors, c.class_claims, c.extra_rules,
+             c.prompt, c.share_signals, c.events),
+            (False, False, 0, False, False, (), "v2", False, False),
+        )
+
+    def test_v1_and_v2_requests_hash_as_before(self):
+        # The cache keys the code produced before agency existed, for one fixed context: a legacy
+        # run replays from its answer cache only if these do not move.
+        from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
+        from appfl.decentralized.algorithm.adko_h.llm.policy import CampaignPolicy, MockClient
+        from appfl.decentralized.algorithm.adko_v2.llm.client import request_key
+
+        problem = Synthetic(seed=0)
+        a = ADKOHAgent("Agent0", 0, GP(), problem, AgentConfig(hit_threshold=0.6, share_hits=True),
+                       neighbor_indices=[1], degree=1, planner=object(),
+                       centers=problem.region_space.centers(2, 0))
+        ctx = a.plan_context(5)
+        want = {"v1": "9b9e42f3eb8fb2bc6500636d982e3e4649e630a21dfb2439df546dfc5aa054c3",
+                "v2": "dbe409f5533f20c875732705e20f91e8b455565dbf04b0bf4241954f22f857af"}
+        for prompt, key in want.items():
+            pol = CampaignPolicy(MockClient(problem.region_space), problem.region_space, prompt=prompt,
+                                 budget_range=(2, 10), note=prompt == "v2")
+            self.assertEqual(request_key(pol._request(ctx), "mock"), key, prompt)
+
+    def test_a_token_without_signals_has_exactly_the_old_fields(self):
+        tok = encode(agent_id="Agent0", source=0, round=0, x_shared=[0.1], u=0.5, history=[0.5],
+                     quantizer=Quantizer(8))
+        self.assertEqual(set(tok.to_dict()), {"x", "q", "insight", "tag", "provenance", "descriptor",
+                                              "family", "claims", "verdicts", "relayed"})
+        self.assertEqual(HToken.deserialize(tok.serialize()).serialize(), tok.serialize())
+
+    def test_events_watch_and_change_nothing(self):
+        def go(events):
+            import json
+            import tempfile
+
+            problem = Synthetic(seed=0)
+            planner = build_planner(problem.region_space, "mock", seed=0, prompt="v2")
+            cfg = RunConfig(rounds=12, agents=3, seed=0, topology="random_regular",
+                            topology_kwargs={"k": 2, "seed": 0}, planner="llm", start_points=6,
+                            agent_cfg=AgentConfig(warmup_rounds=2, pool_size=64, hit_threshold=0.6,
+                                                  share_hits=True, events=events))
+            with tempfile.TemporaryDirectory() as d:
+                run(problem, GP, cfg, planner=planner, out=d)
+                agents = json.loads((Path(d) / "run.json").read_text())["agents"]
+                csv = (Path(d) / "records.csv").read_text()
+            planner.close()
+            return csv, [a["records"] for a in agents], [a["campaigns"] for a in agents]
+
+        self.assertEqual(go(False), go(True))
+
+    def test_a_default_agent_collects_no_events(self):
+        a = agency()
+        a.set_campaign(design(a.space), 0)
+        step(a, 0, SURPRISE)
+        self.assertEqual(a.drain_events(), [])
+        self.assertEqual(a.tickets, [])
+
+
+class TestSignals(unittest.TestCase):
+    """A1: signals on outcomes, kept per run, on the token only when shared."""
+
+    def test_signals_are_kept_and_recorded(self):
+        a = agency()
+        a.set_campaign(design(a.space), 0)
+        _, tok = step(a, 0, SURPRISE)
+        self.assertEqual(a._signals[-1], SURPRISE)
+        self.assertEqual(a.records[-1]["signals"], SURPRISE)
+        self.assertEqual(a.campaign.runs[-1]["signals"], SURPRISE)
+        self.assertEqual(tok.signals, {})  # not shared unless asked
+        self.assertNotIn("signals", tok.to_dict())
+
+    def test_shared_bits_are_few_and_a_surprise_says_where_it_sat(self):
+        a = agency(share_signals=True)
+        a.set_campaign(design(a.space), 0)
+        p, tok = step(a, 0, SURPRISE)
+        self.assertEqual(tok.signals, {"mismatch": True, "kind": "wetting_absent", "surprise": True,
+                                       "at": [round(float(v), 4) for v in p.F]})
+        _, plain = step(a, 1, MATCH)
+        self.assertEqual(plain.signals, {"mismatch": False, "surprise": False})
+        back = HToken.deserialize(tok.serialize())
+        self.assertEqual(back.signals, tok.signals)
+        bare = encode(agent_id="Agent0", source=0, round=0, x_shared=tok.x, u=0.5, history=[0.5],
+                      quantizer=Quantizer(8), family=tok.family)
+        self.assertGreater(tok.payload_bits(), bare.payload_bits())
+
+    def test_a_neighbours_surprise_is_listed_with_an_id(self):
+        a = agency(prompt="v3")
+        a.set_campaign(design(a.space), 0)
+        step(a, 0, SURPRISE)
+        at = [0.9, 0.05, 0.9, 0.9, 0.9]
+        a.observe([encode(agent_id="Agent1", source=1, round=0, x_shared=at, u=0.5, history=[0.5],
+                          quantizer=Quantizer(8),
+                          signals={"kind": "over_demixed", "mismatch": True, "surprise": True, "at": at})])
+        rows = a.plan_context(1)["surprises"]
+        self.assertEqual([(s["id"], s["source"], s["kind"]) for s in rows],
+                         [("s0", "mine", "wetting_absent"), ("s1", "a1", "over_demixed")])
+        self.assertIn("x1=0.9", rows[1]["recipe"])
+
+
+class TestRevise(unittest.TestCase):
+    """A2: a pending result settles later; the agent's view follows, judged verdicts stay."""
+
+    def test_revise_replaces_score_family_signals_and_refits(self):
+        a = agency(share_signals=True, start=6)
+        c = a.set_campaign(design(a.space, budget=4), 0)
+        p0, _ = step(a, 0, PENDING, score=0.1, family="")
+        mu0, _ = a.surrogate.predict(p0.X[None, :])
+        events = a.revise(p0.key, Outcome(score=0.9, descriptor=np.ones(3), family="beta", signals=MATCH), 1)
+        self.assertEqual(events[0]["type"], "label_revision")
+        self.assertEqual((events[0]["old"]["score"], events[0]["new"]["score"]), (0.1, 0.9))
+        self.assertEqual(events[0]["campaign"], c.claim_id)
+        self.assertEqual((a._u[-1], a._fams[-1], a._signals[-1]), (0.9, "beta", MATCH))
+        np.testing.assert_array_equal(a._desc[-1], np.ones(3))
+        self.assertEqual((c.runs[0]["score"], c.runs[0]["family"], c.runs[0]["signals"]), (0.9, "beta", MATCH))
+        mu1, _ = a.surrogate.predict(p0.X[None, :])
+        self.assertNotAlmostEqual(float(mu0[0]), float(mu1[0]))
+        _, tok = step(a, 1, MATCH)  # the next token carries the revision
+        self.assertEqual(tok.revised, [{"r": 0, "family": "beta", "mismatch": False, "surprise": False}])
+        self.assertEqual(a.drain_events(), [])  # returned, not collected: events are off
+
+    def test_a_judged_campaign_keeps_its_verdict(self):
+        a = agency(parts=True)  # any agency switch: with none, signals never reach a verdict
+        c = a.set_campaign(design(a.space, budget=2), 0)
+        p0, _ = step(a, 0, PENDING)
+        step(a, 1, PENDING)
+        before = dict(c.verdict)
+        self.assertEqual((before["value"], before["n_pending"]), (0.0, 2))
+        a.revise(p0.key, Outcome(score=0.5, signals=SURPRISE), 2)
+        self.assertEqual(c.verdict, before)
+        self.assertEqual(c.runs[0]["signals"], SURPRISE)
+
+    def test_only_own_runs_can_be_revised(self):
+        a = agency(start=3)
+        with self.assertRaises(KeyError):
+            a.revise(a._keylist[0], Outcome(score=0.5), 0)  # a shared initial point
+        with self.assertRaises(KeyError):
+            a.revise(10**9, Outcome(score=0.5), 0)
+
+    def test_the_same_revisions_give_the_same_picks(self):
+        def go():
+            a = agency(followup=1, replan_on_surprise=True)
+            a.set_campaign(design(a.space, budget=6), 0)
+            keys = []
+            for rnd in range(8):
+                if rnd == 3:
+                    a.revise(keys[1], Outcome(score=0.7, signals=SURPRISE), rnd)
+                if a.needs_plan(rnd):
+                    a.set_campaign(design(a.space, budget=3, rule="novelty"), rnd)
+                p, _ = step(a, rnd, PENDING if rnd < 2 else MATCH)
+                keys.append(p.key)
+            return keys, [r["rule"] for r in a.records]
+
+        self.assertEqual(go(), go())
+
+
+class TestParts(unittest.TestCase):
+    """A3: multi-part campaigns; a legacy design is one part."""
+
+    def test_a_legacy_design_is_one_part(self):
+        sp = space2()
+        c = Campaign(region=sp.full(), rule="explore", budget=4)
+        self.assertEqual((len(c.parts), c.parts[0].n, c.budget, c.multipart), (1, 4, 4, False))
+        self.assertNotIn("parts", c.to_dict(sp))
+        c.add_run({"key": 1})
+        self.assertEqual(c.runs, [{"key": 1}])  # no part tag on a legacy run
+
+    def test_counts_are_clamped_to_the_budget_range(self):
+        from appfl.decentralized.algorithm.adko_h.campaign import clamp_counts
+
+        self.assertEqual(clamp_counts([4, 4, 4], (2, 6)), [4, 1, 1])
+        self.assertEqual(clamp_counts([0, 1], (5, 9)), [1, 4])
+        self.assertEqual(clamp_counts([1, 1, 1, 1], (2, 3)), [1, 1, 1])
+        self.assertEqual(clamp_counts([2, 3], (2, 6)), [2, 3])
+
+    def test_parts_run_in_order_and_are_judged_together(self):
+        a = agency(parts=True)
+        sp = a.space
+        c = a.set_campaign(parts_design(sp, [({"x1": (0.0, 0.2)}, "explore", 2),
+                                             ({"x1": (0.6, 0.8)}, "novelty", 1)]), 0)
+        self.assertEqual((c.budget, c.multipart, c.rule), (3, True, "explore"))
+        claims, _ = a.claims.outbox()
+        self.assertEqual([m.claim_id for m in claims], ["a0c0p0", "a0c0p1"])  # one claim per part
+        got = [step(a, r, MATCH)[0] for r in range(3)]
+        self.assertEqual([p.rule for p in got], ["explore", "explore", "novelty"])
+        self.assertTrue(all(0.0 <= p.F[0] <= 0.2 for p in got[:2]))
+        self.assertTrue(0.6 <= got[2].F[0] <= 0.8)
+        self.assertEqual([r["part"] for r in c.runs], [0, 0, 1])
+        self.assertIsNotNone(c.verdict)
+        self.assertEqual(sp.unpack(a.claims.verdicts[(0, "a0c0")].region).bounds["x1"], (0.0, 0.8))
+
+    def test_without_parts_a_design_keeps_its_first_part(self):
+        a = agency()
+        c = a.set_campaign(parts_design(a.space, [({"x1": (0.0, 0.2)}, "explore", 3),
+                                                  ({"x1": (0.6, 0.8)}, "novelty", 3)]), 0)
+        self.assertEqual((len(c.parts), c.budget), (1, 3))
+
+    def test_a_part_with_no_candidates_falls_back_and_says_so(self):
+        a = agency(parts=True)
+        c = a.set_campaign(parts_design(a.space, [({"x1": (0.95, 1.0), "x2": (0.95, 1.0)}, "explore", 2)]), 0)
+        a.propose(0)
+        self.assertTrue(a.diag["region_empty"])
+        self.assertEqual(a.diag["part"], 0)
+        self.assertEqual(c.part_index, 0)
+
+
+class TestSignalTests(unittest.TestCase):
+    """A4: the signal metrics, pending runs left out, and class claims with code-set status."""
+
+    def test_signal_metrics_leave_pending_runs_out(self):
+        other = {**SURPRISE, "kind": "over_demixed", "novelty": 2.0}
+        ev = Evidence(signals=[SURPRISE, MATCH, PENDING, other], parts=[0, 0, 0, 1])
+        self.assertEqual(Test("mismatches").value(ev), 2.0)
+        self.assertAlmostEqual(Test("mismatch_rate").value(ev), 2 / 3)
+        self.assertEqual(Test("surprises").value(ev), 2.0)
+        self.assertEqual(Test("max_novelty").value(ev), 2.0)  # the pending 5.0 does not count
+        none = Evidence(signals=[PENDING])
+        self.assertEqual((Test("mismatch_rate").value(none), Test("max_novelty").value(none)), (0.0, 0.0))
+
+    def test_a_verdict_counts_pending_runs_only_when_there_are_signals(self):
+        sp = space2()
+        c = Campaign(region=sp.full(), test=Test("mismatch_rate", ">=", 0.5))
+        v = c.judge(Evidence(signals=[SURPRISE, PENDING], parts=[0, 0]))
+        self.assertEqual((v["value"], v["success"], v["n_pending"]), (1.0, True, 1))
+        self.assertNotIn("n_pending", Campaign(region=sp.full()).judge(Evidence()))
+
+    def test_claim_status_is_set_by_code(self):
+        from appfl.decentralized.algorithm.adko_h.campaign import claim_status
+
+        ev = Evidence(signals=[SURPRISE, MATCH, PENDING, MATCH], parts=[0, 0, 0, 1])
+        self.assertEqual(claim_status(ev, 0, "mismatch")["status"], "supported")  # 1 of 2 settled
+        self.assertEqual(claim_status(ev, 0, "P1")["status"], "supported")
+        self.assertEqual(claim_status(ev, 1, "wetting_absent")["status"], "refuted")
+        self.assertEqual(claim_status(ev, 2, "mismatch")["status"], "unsettled")
+        self.assertEqual(claim_status(Evidence(signals=[PENDING], parts=[0]), 0, "P1")["status"], "unsettled")
+
+    def test_a_class_claim_is_announced_and_its_status_travels(self):
+        a = agency(parts=True, class_claims=True)
+        sp = a.space
+        c = a.set_campaign(parts_design(sp, [({"x1": (0.0, 0.4)}, "explore", 2), ({}, "novelty", 1)],
+                                        claim={"part": 0, "class": "mismatch"}), 0)
+        claims, _ = a.claims.outbox()
+        self.assertEqual([m.predicts for m in claims], ["mismatch", ""])
+        step(a, 0, SURPRISE)
+        step(a, 1, MATCH)
+        _, tok = step(a, 2, MATCH)
+        self.assertEqual(c.claim["status"], "supported")
+        self.assertEqual(c.verdict["claim"]["status"], "supported")
+        cv = [v for v in tok.verdicts if v.metric == "class_claim"]
+        self.assertEqual([(v.claim_id, v.status, v.predicts, v.value) for v in cv],
+                         [("a0c0p0", "supported", "mismatch", 0.5)])
+        self.assertIn('SUPPORTED: class claim "mismatch"', cv[0].line(sp))
+
+    def test_a_claim_on_no_part_or_an_unknown_class_is_dropped(self):
+        a = agency(parts=True, class_claims=True)
+        for claim in ({"part": 3, "class": "alpha"}, {"part": 0, "class": "unicorn"}, "alpha"):
+            c = a.set_campaign(parts_design(a.space, [({}, "explore", 2)], claim=claim), 0)
+            self.assertIsNone(c.claim)
+        self.assertEqual(a.set_campaign(parts_design(a.space, [({}, "explore", 2)],
+                                                     claim={"part": 0, "class": "alpha"}), 0).claim["class"],
+                         "alpha")  # one of the problem's classes
+
+
+class TestTickets(unittest.TestCase):
+    """A5: code-owned follow-up of a surprise."""
+
+    def test_a_surprise_opens_a_ticket_and_the_campaign_waits(self):
+        a = agency(followup=2)
+        c = a.set_campaign(design(a.space, budget=6), 0)
+        p0, tok0 = step(a, 0, SURPRISE)
+        t = a.tickets[0]
+        self.assertEqual((t.id, t.surprise, t.origin_key, t.kind, t.draws), ("a0t0", "s0", p0.key, "wetting_absent", 2))
+        self.assertTrue(t.drawing)
+        p1 = a.propose(1)
+        self.assertEqual((p1.rule, p1.claim_id), ("followup", "a0t0"))
+        sp = a.space
+        mask = t.region.mask(sp, a._cands.F)
+        d = np.sqrt(((sp.normalize(a._cands.F) - sp.normalize(p0.F[None, :])[0]) ** 2).sum(axis=1))
+        self.assertAlmostEqual(float(d[list(a._cands.key).index(p1.key)]), float(d[mask].min()))
+        self.assertTrue(t.region.mask(sp, p1.F[None, :])[0])
+        a.complete(p1, Outcome(score=0.5, signals=MATCH), 1)
+        self.assertEqual((c.spent, t.spent), (1, 1))  # the campaign waited
+        _, tok2 = step(a, 2, SURPRISE)  # the second draw reproduces it
+        self.assertEqual((t.status, len(a.tickets)), ("reproduced", 1))  # a draw opens no ticket
+        tv = [v for v in tok2.verdicts if v.metric == "ticket"]
+        self.assertEqual([(v.claim_id, v.status, v.predicts, v.value) for v in tv],
+                         [("a0t0", "reproduced", "wetting_absent", 1.0)])
+        p3, _ = step(a, 3, MATCH)
+        self.assertEqual((p3.rule, c.spent), ("explore", 2))  # and resumed
+        self.assertEqual(a.surprises[0]["status"], "reproduced")
+        self.assertEqual(a.surprises[1]["status"], "follow-up draw")
+
+    def test_ticket_status_follows_its_draws(self):
+        from appfl.decentralized.algorithm.adko_h.campaign import Ticket
+
+        def ticket(*sigs, draws=2):
+            t = Ticket(id="a0t0", surprise="s0", origin_key=1, F=[0.5], kind="wetting_absent", draws=draws)
+            t.runs = [{"key": i, "signals": dict(s)} for i, s in enumerate(sigs)]
+            t.spent = len(sigs)
+            return t
+
+        self.assertEqual(ticket(MATCH, SURPRISE).outcome(), "reproduced")
+        self.assertEqual(ticket(MATCH, MATCH).outcome(), "not_reproduced")
+        self.assertEqual(ticket(MATCH, {**SURPRISE, "kind": "over_demixed"}).outcome(), "not_reproduced")
+        self.assertIsNone(ticket(MATCH, PENDING).outcome())  # waits for the label
+        self.assertEqual(ticket(MATCH, PENDING).outcome(final=True), "unsettled")
+        self.assertIsNone(ticket(MATCH).outcome())  # a draw left
+        self.assertEqual(ticket(MATCH).outcome(final=True), "unsettled")
+
+    def test_surprises_queue_beyond_the_open_tickets(self):
+        a = agency(followup=1, max_open_tickets=1)
+        a.set_campaign(design(a.space, budget=8), 0)
+        k0 = step(a, 0, PENDING)[0].key
+        k1 = step(a, 1, PENDING)[0].key
+        a.revise(k0, Outcome(score=0.5, signals=SURPRISE), 2)  # a late surprise opens a ticket too
+        a.revise(k1, Outcome(score=0.5, signals=SURPRISE), 2)
+        self.assertEqual((len(a.tickets), a._queue), (1, ["s1"]))
+        p, _ = step(a, 2, MATCH)  # t0's only draw; t0 stops drawing and s1 gets its ticket
+        self.assertEqual((p.claim_id, [t.id for t in a.tickets], a._queue), ("a0t0", ["a0t0", "a0t1"], []))
+        self.assertEqual(step(a, 3, MATCH)[0].claim_id, "a0t1")
+
+    def test_the_end_of_the_run_closes_what_is_open(self):
+        a = agency(followup=2)
+        a.set_campaign(design(a.space), 0)
+        step(a, 0, SURPRISE)
+        step(a, 1, PENDING)
+        events = a.finish(2)
+        self.assertEqual([(e["type"], e["status"], e["final"]) for e in events],
+                         [("ticket_close", "unsettled", True)])
+        self.assertEqual(a.tickets[0].status, "unsettled")
+
+
+class TestReplan(unittest.TestCase):
+    """A6: a surprise closes the campaign early; the planner is asked once the draws are spent."""
+
+    def test_early_close_and_replan_after_the_draws(self):
+        a = agency(followup=1, replan_on_surprise=True)
+        c = a.set_campaign(design(a.space, budget=5), 0)
+        step(a, 0, MATCH)
+        _, tok = step(a, 1, SURPRISE)
+        self.assertEqual((c.verdict["early"], c.verdict["spent"], c.done), ("surprise", 2, True))
+        self.assertEqual(c.to_dict(a.space)["early"], "surprise")
+        self.assertEqual([v.claim_id for v in tok.verdicts], ["a0c0"])
+        self.assertIsNotNone(tok.insight)
+        self.assertFalse(a.needs_plan(2))  # the follow-up draw first
+        step(a, 2, MATCH)
+        self.assertTrue(a.needs_plan(3))
+
+    def test_without_followup_the_next_round_replans(self):
+        a = agency(replan_on_surprise=True)
+        c = a.set_campaign(design(a.space, budget=5), 0)
+        step(a, 0, SURPRISE)
+        self.assertTrue(c.done and a.needs_plan(1))
+
+    def test_a_late_surprise_closes_the_open_campaign_too(self):
+        a = agency(replan_on_surprise=True)
+        a.set_campaign(design(a.space, budget=2), 0)
+        k = step(a, 0, PENDING)[0].key
+        step(a, 1, MATCH)  # the first campaign closes normally
+        c2 = a.set_campaign(design(a.space, budget=5), 2)
+        step(a, 2, MATCH)
+        events = a.revise(k, Outcome(score=0.5, signals=SURPRISE), 3)
+        self.assertEqual(c2.verdict["early"], "surprise")
+        # Events are off, yet revise returns what it set off: the revision and the early verdict.
+        self.assertEqual([e["type"] for e in events], ["label_revision", "campaign_verdict"])
+        self.assertEqual(a.drain_events(), [])
+
+
+class TestAnchors(unittest.TestCase):
+    """A7: a part anchored on a surprise contains it."""
+
+    def test_widen_and_hull(self):
+        sp = space2()
+        r = sp.region(bounds={"x": (2.0, 4.0)}, picks={"s": [0]})
+        w = sp.widen(r, [7.0, 2.0])
+        self.assertEqual((w.bounds, w.picks), ({"x": (2.0, 7.0)}, {"s": (0, 2)}))
+        self.assertEqual(sp.widen(sp.full(), [7.0, 2.0]), sp.full())
+        h = sp.hull([r, sp.region(bounds={"x": (6.0, 8.0)}, picks={"s": [1]})])
+        self.assertEqual((h.bounds, h.picks), ({"x": (2.0, 8.0)}, {"s": (0, 1)}))
+        self.assertEqual(sp.hull([r, sp.full()]), sp.full())
+
+    def test_an_anchor_widens_its_part_and_nothing_else(self):
+        a = agency(parts=True, anchors=True)
+        a.set_campaign(design(a.space), 0)
+        p0, _ = step(a, 0, SURPRISE)
+        f = [float(v) for v in p0.F]
+        c = a.set_campaign(parts_design(a.space, [({"x1": (0.0, 0.01), "x2": (0.0, 0.01)}, "explore", 2, "s0"),
+                                                  ({"x1": (0.0, 0.01)}, "explore", 2)]), 1)
+        b = c.parts[0].region.bounds
+        self.assertEqual(c.parts[0].anchor, "s0")
+        self.assertTrue(c.parts[0].region.mask(a.space, np.asarray([f]))[0])
+        self.assertEqual((b["x1"][0], b["x2"][0]), (0.0, 0.0))  # only stretched up to the recipe
+        self.assertEqual(c.parts[1].region.bounds, {"x1": (0.0, 0.01)})
+
+    def test_an_unknown_anchor_is_dropped_and_logged(self):
+        a = agency(parts=True, anchors=True, events=True)
+        c = a.set_campaign(parts_design(a.space, [({"x1": (0.0, 0.2)}, "explore", 2, "s9")]), 0)
+        self.assertEqual((c.parts[0].anchor, c.anchors_dropped), (None, ["s9"]))
+        self.assertEqual(c.parts[0].region.bounds, {"x1": (0.0, 0.2)})
+        self.assertEqual(a.drain_events()[0]["anchors_dropped"], ["s9"])
+
+    def test_anchors_off_ignores_them(self):
+        a = agency(parts=True)
+        a.set_campaign(design(a.space), 0)
+        step(a, 0, SURPRISE)
+        c = a.set_campaign(parts_design(a.space, [({"x1": (0.0, 0.01)}, "explore", 2, "s0")]), 1)
+        self.assertEqual((c.parts[0].anchor, c.anchors_dropped, c.parts[0].region.bounds),
+                         (None, [], {"x1": (0.0, 0.01)}))
+
+
+class TestProblemRules(unittest.TestCase):
+    """A8: rules a problem supplies, and the fallback when one breaks."""
+
+    def setUp(self):
+        self.seen = []
+
+        def low(view):
+            self.seen.append(view)
+            return -view.cands.F[:, 0]
+
+        self.problem = SignalSynthetic(seed=0, fns={"lowx1": low, "boom": lambda v: 1 / 0,
+                                                    "short": lambda v: np.zeros(3)})
+
+    def test_a_problem_rule_ranks_the_pool(self):
+        from appfl.decentralized.algorithm.adko_h.problem import RuleView
+
+        a = agency(self.problem, extra_rules=("lowx1",))
+        a.set_campaign(design(a.space, rule="lowx1"), 0)
+        p = a.propose(0)
+        self.assertEqual(p.rule, "lowx1")
+        self.assertAlmostEqual(p.F[0], float(a._cands.F[:, 0].min()))
+        v = self.seen[0]
+        self.assertIsInstance(v, RuleView)
+        self.assertEqual((v.agent, v.round, v.rule, v.part, v.mu.shape, v.own_X.shape[0]),
+                         (0, 0, "lowx1", 0, (len(a._cands),), 0))
+        again = SignalSynthetic(seed=0, fns=self.problem.fns)
+        b = agency(again, extra_rules=("lowx1",))
+        b.set_campaign(design(b.space, rule="lowx1"), 0)
+        self.assertEqual(b.propose(0).key, p.key)
+        self.assertEqual(self.seen[-1].seed, v.seed)  # deterministic per (seed, agent, round)
+
+    def test_a_rule_that_breaks_falls_back_to_explore(self):
+        for name, why in (("boom", "ZeroDivisionError"), ("short", "shape"), ("absent", "supplies no rule")):
+            with self.subTest(rule=name):
+                a = agency(self.problem, extra_rules=(name,), events=True)
+                a.set_campaign(design(a.space, rule=name), 0)
+                p = a.propose(0)
+                _, sigma = a.surrogate.predict(a._cands.X)
+                self.assertEqual(p.key, int(a._cands.key[int(np.argmax(sigma))]))
+                self.assertIn(why, a.diag["rule_error"])
+                self.assertIn("rule_error", [e["type"] for e in a.drain_events()])
+
+    def test_extra_rules_reach_the_planner_and_may_not_shadow_built_ins(self):
+        from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent
+
+        a = agency(self.problem, extra_rules=("lowx1",), prompt="v3")
+        self.assertEqual(a.plan_context(0)["rules"], list(hrules.RULES) + ["lowx1"])
+        with self.assertRaises(ValueError):
+            ADKOHAgent("Agent0", 0, GP(), self.problem, AgentConfig(extra_rules=("explore",)))
+        self.assertEqual(hrules.valid_rule("lowx1"), "adko")
+        self.assertEqual(hrules.valid_rule("lowx1", ("lowx1",)), "lowx1")
+
+
+class FakeWorkspace:
+    """The harness's workspace, as APPFL sees it: three calls, and a record of each."""
+
+    def __init__(self, block="notes: none yet"):
+        self.block = block
+        self.applied = []
+
+    def context(self, agent, rnd):
+        return self.block
+
+    def schema(self, agent):
+        return {"type": "object", "additionalProperties": False, "required": ["write"],
+                "properties": {"write": {"type": "array", "minItems": 1,
+                                         "items": {"type": "object", "additionalProperties": False,
+                                                   "required": ["path", "text"],
+                                                   "properties": {"path": {"type": "string"},
+                                                                  "text": {"type": "string"}}}}}}
+
+    def apply(self, agent, rnd, value):
+        self.applied.append((agent, rnd, value))
+        return {"agent": agent, "round": rnd, "ops": len((value or {}).get("write", []))}
+
+
+class TestWorkspace(unittest.TestCase):
+    """A9: the workspace hook. APPFL passes text and an object through and knows no files."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.problem = SignalSynthetic(seed=0)
+        a = agency(self.problem, prompt="v3", parts=True)
+        self.ctx = a.plan_context(5)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def policy(self, ws, prompt="v3"):
+        from appfl.decentralized.algorithm.adko_h.llm.policy import CampaignPolicy, MockClient
+
+        sp = self.problem.region_space
+        return CampaignPolicy(MockClient(sp), sp, run_dir=self.tmp.name, prompt=prompt, workspace=ws,
+                              budget_range=(2, 6))
+
+    def test_context_schema_and_apply(self):
+        import json
+
+        ws = FakeWorkspace("NOTES-42")
+        pol = self.policy(ws)
+        req = pol._request(self.ctx)
+        self.assertIn("## My workspace\nNOTES-42", req["input"])
+        sch = req["text"]["format"]["schema"]
+        self.assertIn("workspace", sch["properties"])
+        self.assertIn("workspace", sch["required"])
+        (d,) = pol.plan([self.ctx])
+        self.assertEqual(ws.applied, [(0, 5, {"write": [{"path": "mock", "text": "mock"}]})])
+        self.assertEqual(d["workspace_log"], {"agent": 0, "round": 5, "ops": 1})
+        pol.close()
+        row = json.loads((Path(self.tmp.name) / "llm_calls.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(row["workspace"], {"agent": 0, "round": 5, "ops": 1})
+
+    def test_the_block_is_in_the_cache_key_and_a_replay_applies_again(self):
+        from appfl.decentralized.algorithm.adko_v2.llm.client import request_key
+
+        a, b = self.policy(FakeWorkspace("one")), self.policy(FakeWorkspace("two"))
+        self.assertNotEqual(request_key(a._request(self.ctx), "mock"), request_key(b._request(self.ctx), "mock"))
+        b.close()
+        a.plan([self.ctx])
+        a.close()
+        ws = FakeWorkspace("one")
+        replay = self.policy(ws)
+        replay.plan([self.ctx])
+        replay.close()
+        self.assertEqual(replay.totals["cached"], 1)
+        self.assertEqual(len(ws.applied), 1)
+
+    def test_a_v2_planner_takes_a_workspace_too(self):
+        ws = FakeWorkspace("v2 notes")
+        pol = self.policy(ws, prompt="v2")
+        ctx = agency(self.problem).plan_context(5)
+        self.assertTrue(pol._request(ctx)["input"].endswith("## My workspace\nv2 notes"))
+        (d,) = pol.plan([ctx])
+        pol.close()
+        self.assertEqual(d["workspace"], {"write": [{"path": "mock", "text": "mock"}]})
+
+
+class TestPromptV3(unittest.TestCase):
+    """A10: the version-3 prompt, schema, parser and mock."""
+
+    def agent(self, **kw):
+        kw.setdefault("prompt", "v3")
+        return agency(SignalSynthetic(seed=0, fns={"lowx1": lambda v: -v.cands.F[:, 0]}), **kw)
+
+    def test_the_prompt_says_target_role_signals_surprises_and_follow_ups(self):
+        from appfl.decentralized.algorithm.adko_h.llm import prompts
+
+        a = self.agent(parts=True, anchors=True, class_claims=True, followup=1, replan_on_surprise=True,
+                       extra_rules=("lowx1",))
+        a.set_campaign(design(a.space, budget=3), 0)
+        step(a, 0, SURPRISE)
+        step(a, 1, PENDING)
+        ctx = a.plan_context(2)
+        system, user = prompts.system_v3(ctx), prompts.user_v3(ctx)
+        for text in ("observed class differs from the predicted one", "hunt wetting changes", "s0 (mine",
+                     "a0t0 for s0 (wetting_absent)", "Use 1 to 3 parts", "lowx1: the smallest x1",
+                     "mismatch_rate:", "Class claim options: alpha", "closed early by a surprise",
+                     "1 settled, 0 pending"):
+            self.assertIn(text, user)
+        for text in ("anchor", "ends your current campaign early", "Code sets the claim's status"):
+            self.assertIn(text, system)
+        plain = self.agent()
+        self.assertNotIn("anchor", prompts.system_v3(plain.plan_context(0)))
+        self.assertIn("Use one part", prompts.user_v3(plain.plan_context(0)))
+
+    def test_the_schema_has_exactly_what_the_arm_uses(self):
+        sp = SignalSynthetic().region_space
+        fmt = hschema.campaign_format_v3(sp, budget_range=(2, 6), rules=hrules.RULES + ("lowx1",),
+                                         max_parts=3, classes=("alpha", "mismatch"), anchors=True)
+        s = fmt["schema"]
+        self.assertEqual((fmt["name"], s["properties"]["parts"]["maxItems"]), ("campaign_v3", 3))
+        part = s["properties"]["parts"]["items"]["properties"]
+        self.assertEqual(part["rule"]["enum"][-1], "lowx1")
+        self.assertIn("anchor", part)
+        self.assertEqual(s["properties"]["claim"]["properties"]["class"]["enum"], ["alpha", "mismatch"])
+        self.assertEqual(s["properties"]["test"]["properties"]["metric"]["enum"][:4],
+                         ["mismatches", "mismatch_rate", "surprises", "max_novelty"])
+        self.assertEqual(set(s["required"]), set(s["properties"]))
+        bare = hschema.campaign_format_v3(sp)["schema"]
+        self.assertNotIn("claim", bare["properties"])
+        self.assertNotIn("anchor", bare["properties"]["parts"]["items"]["properties"])
+        self.assertNotIn("note", bare["properties"])
+
+    def test_the_parser_clips_and_refuses(self):
+        sp = SignalSynthetic().region_space
+        parse = lambda data, **kw: hschema.parse_v3(sp, data, budget_range=(2, 6), max_parts=2,  # noqa: E731
+                                                     claim_classes=("alpha", "mismatch"), **kw)
+        d = parse({"parts": [{"region": {"x1": [0.3, 0.1]}, "rule": "telepathy", "n": 9, "anchor": "s2"},
+                             {"region": {}, "rule": "novelty", "n": 0, "anchor": "nonsense"},
+                             {"region": {}, "rule": "adko", "n": 1}],
+                   "test": {"metric": "mismatch_rate", "op": ">=", "threshold": 0.3},
+                   "claim": {"part": 1, "class": "mismatch"}, "p_success": 7, "workspace": {"w": 1}})
+        self.assertEqual([(p["rule"], p["n"], p["anchor"]) for p in d["parts"]],
+                         [("explore", 5, "s2"), ("novelty", 1, None)])
+        self.assertEqual(d["parts"][0]["region"].bounds, {"x1": (0.1, 0.3)})
+        self.assertEqual((d["budget"], d["rule"], d["p_success"], d["claim"], d["workspace"]),
+                         (6, "explore", 1.0, {"part": 1, "class": "mismatch"}, {"w": 1}))
+        self.assertEqual(d["test"].label(), "mismatch_rate >= 0.3")
+        self.assertIsNone(parse({"parts": [{"region": {}, "rule": "x", "n": 1}],
+                                 "claim": {"part": 5, "class": "alpha"}}))  # nothing said at all
+        self.assertIsNone(parse({"region": {"x1": [0, 1]}}))  # a legacy answer is not a v3 one
+        self.assertIsNone(parse("nope"))
+        kept = parse({"parts": [{"region": {"x1": [0, 0.5]}, "rule": "adko", "n": 2}],
+                      "claim": {"part": 1, "class": "alpha"}})
+        self.assertIsNone(kept["claim"])  # names a part that does not exist
+
+    def test_the_mock_answers_what_the_schema_asks(self):
+        import asyncio
+
+        from appfl.decentralized.algorithm.adko_h.llm.policy import CampaignPolicy, MockClient, _json
+
+        a = self.agent(parts=True, anchors=True, class_claims=True, extra_rules=("lowx1",))
+        a.set_campaign(design(a.space), 0)
+        step(a, 0, SURPRISE)
+        sp = a.space
+        pol = CampaignPolicy(MockClient(sp), sp, prompt="v3", budget_range=(2, 6))
+        for rnd in range(1, 9):
+            ctx = a.plan_context(rnd)
+            resp = asyncio.run(pol.client.complete(pol._request(ctx), ctx))
+            raw = _json(resp["text"])
+            d = pol._parse_v3(raw, ctx)
+            self.assertIsNotNone(d)
+            self.assertTrue(set(raw) >= {"parts", "claim", "test"})
+            self.assertEqual(raw["parts"][0]["anchor"], "s0")
+            self.assertTrue(2 <= d["budget"] <= 6)
+            self.assertTrue(all(p["rule"] in hrules.RULES + ("lowx1",) for p in d["parts"]))
+        pol.close()
+
+    def test_a_v3_run_with_everything_on_is_a_run_and_reproduces(self):
+        import json
+        import tempfile
+
+        def go():
+            problem = SignalSynthetic(seed=0, fns={"lowx1": lambda v: -v.cands.F[:, 0]})
+            planner = build_planner(problem.region_space, "mock", seed=0, prompt="v3", budget_range=(2, 6))
+            cfg = RunConfig(
+                rounds=24, agents=3, seed=0, topology="random_regular", topology_kwargs={"k": 2, "seed": 0},
+                planner="llm", start_points=6,
+                agent_cfg=AgentConfig(warmup_rounds=2, pool_size=48, budget_range=(2, 6), parts=True,
+                                      replan_on_surprise=True, followup=2, anchors=True, class_claims=True,
+                                      extra_rules=("lowx1",), prompt="v3", share_signals=True,
+                                      claim_weight=0.0),
+            )
+            with tempfile.TemporaryDirectory() as d:
+                rec = run(problem, GP, cfg, planner=planner, out=d)
+                agents = json.loads((Path(d) / "run.json").read_text())["agents"]
+            planner.close()
+            return rec, agents
+
+        rec, agents = go()
+        self.assertGreater(rec["campaigns"]["n"], 0)
+        self.assertEqual(rec["endpoints"]["redundancy"], 0)
+        self.assertTrue(any(a["tickets"] for a in agents))
+        self.assertTrue(any(c.get("parts") for a in agents for c in a["campaigns"]))
+        self.assertTrue(any(s["source"] != "mine" for a in agents for s in a["surprises"]))
+        rules = {r["rule"] for a in agents for r in a["records"]}
+        self.assertIn("followup", rules)
+        again, agents2 = go()
+        self.assertEqual(rec["endpoints"], again["endpoints"])
+        self.assertEqual([a["records"] for a in agents], [a["records"] for a in agents2])
+
+
+class TestEvents(unittest.TestCase):
+    """A11: what happened, drained per agent for the ledger."""
+
+    def test_every_event_type_with_its_keys(self):
+        a = agency(followup=1, class_claims=True, parts=True, share_signals=True, events=True,
+                   problem=SignalSynthetic(seed=0, fns={"boom": lambda v: 1 / 0}), extra_rules=("boom",))
+        a.set_campaign(parts_design(a.space, [({}, "boom", 2)], claim={"part": 0, "class": "mismatch"}), 0)
+        k0 = step(a, 0, PENDING)[0].key
+        step(a, 1, SURPRISE)  # closes the campaign (2 picks) and opens a ticket
+        a.observe([encode(agent_id="Agent1", source=1, round=1, x_shared=[0.1] * 5, u=0.5, history=[0.5],
+                          quantizer=Quantizer(8))])
+        step(a, 2, MATCH)  # the ticket's draw: not reproduced
+        a.revise(k0, Outcome(score=0.4, signals=MATCH), 3)
+        events = a.drain_events()
+        self.assertEqual(a.drain_events(), [])
+        self.assertTrue(all({"type", "agent", "round"} <= set(e) for e in events))
+        by = {}
+        for e in events:
+            by.setdefault(e["type"], e)
+        self.assertEqual(set(by), {"campaign_open", "pool", "rule_error", "token_sent", "campaign_verdict",
+                                   "claim_status", "ticket_open", "token_received", "ticket_close",
+                                   "label_revision"})
+        self.assertTrue({"parts", "claim", "test", "budget"} <= set(by["campaign_open"]))
+        self.assertTrue({"verdict", "brier", "early"} <= set(by["campaign_verdict"]))
+        self.assertEqual((by["claim_status"]["status"], by["claim_status"]["class"]), ("supported", "mismatch"))
+        self.assertTrue({"top", "chosen", "rule", "part"} <= set(by["pool"]))
+        self.assertTrue({"key", "value", "mu", "sigma", "in_region"} <= set(by["pool"]["chosen"]))
+        self.assertLessEqual(len(by["pool"]["top"]), 8)
+        self.assertTrue({"bits", "family", "kind", "surprise", "claims", "verdicts", "relayed"}
+                        <= set(by["token_sent"]))
+        self.assertTrue({"sender", "accepted", "skipped"} <= set(by["token_received"]))
+        self.assertEqual(by["ticket_close"]["status"], "not_reproduced")
+
+
 if __name__ == "__main__":
     unittest.main()
