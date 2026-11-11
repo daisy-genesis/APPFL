@@ -21,6 +21,15 @@ What this does *not* do is pick experiments with a language model. The L3 screen
 and it lost to the score it was replacing; the same calls spent one level up buy a region, a
 rule, a budget and a falsifiable test instead, and every experiment stays with the calibrated
 rule that won.
+
+**Agency** (every part off by default; ``AgentConfig`` turns each on). The snapshot read-out
+showed what the planner lacked: the signal the read-out judges by, and the code-owned follow-up
+that found the swarm's new states. So results may carry signals (``signals.py``) and late
+labels (:meth:`ADKOHAgent.revise`); a design may come in parts, carry a class claim whose status
+code sets, and anchor a part on a surprise; a surprise opens a ticket of follow-up draws and may
+close the campaign early so the planner re-plans with it in view; a problem may add rules; and
+everything that happens can be drained as events for a ledger. None of it puts the model back
+into a pick.
 """
 
 from __future__ import annotations
@@ -33,11 +42,16 @@ import numpy as np
 
 from appfl.decentralized.algorithm.adko_h import metrics as hmetrics
 from appfl.decentralized.algorithm.adko_h import rules as hrules
+from appfl.decentralized.algorithm.adko_h import signals as hsignals
 from appfl.decentralized.algorithm.adko_h.campaign import (
     BUDGET_RANGE,
+    METRICS_V3,
+    RULES,
     Campaign,
     Evidence,
+    Part,
     Test,
+    Ticket,
     random_design,
 )
 from appfl.decentralized.algorithm.adko_h.claims import (
@@ -51,8 +65,9 @@ from appfl.decentralized.algorithm.adko_h.claims import (
     Claim,
     ClaimStore,
     Verdict,
+    region_of,
 )
-from appfl.decentralized.algorithm.adko_h.problem import Candidates, Outcome, Pick, Problem
+from appfl.decentralized.algorithm.adko_h.problem import Candidates, Outcome, Pick, Problem, RuleView
 from appfl.decentralized.algorithm.adko_h.region import KIND_CAT
 from appfl.decentralized.algorithm.adko_h.token import HToken, encode, quantize_descriptor
 from appfl.decentralized.algorithm.adko_v2.components import Surrogate
@@ -131,6 +146,29 @@ class AgentConfig:
             hypothesis instead of a truncation, the planner is asked for one sentence to its
             neighbours and that sentence travels, and a verdict says which box its hits fell
             in. The arm that asks whether the words are worth the bits; implies ``share_text``.
+
+    Agency (all off by default; with these at their defaults the agent is the one above):
+
+        parts: accept multi-part designs (the version-3 schema): up to ``max_parts`` regions,
+            each with a rule and a count, run in order and judged together. Off, a design in
+            parts keeps its first part only.
+        replan_on_surprise: a surprise closes the open campaign early (judged on its runs so
+            far, verdict ``early: "surprise"``), so the planner is asked again once the
+            agent's follow-up draws are spent.
+        followup: follow-up draws per surprise (0 = off). A surprise opens a ticket: the next
+            picks are the nearest unrun candidates to it inside a box of half-width
+            ``followup_half_width`` (unit cube), and the campaign waits. At most
+            ``max_open_tickets`` tickets draw at once; further surprises queue.
+        anchors: a part may name a surprise (``s<k>``); its region is widened to contain it.
+        class_claims: a design may claim ``{part: j, class: C}``; code sets its status.
+        extra_rules: rule names the problem supplies (``Problem.rules()``), offered to the
+            planner besides the built-in five.
+        prompt: ``"v3"`` gives the planner the version-3 context (signals, surprises, tickets,
+            parts); the planner's own ``prompt`` must say ``"v3"`` too. Earlier versions'
+            contexts are unchanged.
+        share_signals: tokens carry a result's signal bits (kind, mismatch, surprise; where a
+            surprise sat) and revisions of earlier results, so neighbours see surprises.
+        events: collect events (:meth:`ADKOHAgent.drain_events`) for a ledger.
     """
 
     weights: ReasoningWeights = field(default_factory=ReasoningWeights)
@@ -161,6 +199,46 @@ class AgentConfig:
     hit_threshold: Optional[float] = None
     share_hits: bool = False
     share_detail: bool = False
+    parts: bool = False
+    max_parts: int = 3
+    replan_on_surprise: bool = False
+    followup: int = 0
+    followup_half_width: float = 0.05
+    max_open_tickets: int = 2
+    anchors: bool = False
+    class_claims: bool = False
+    extra_rules: Tuple[str, ...] = ()
+    prompt: str = "v2"
+    share_signals: bool = False
+    events: bool = False
+    # Text limits, in characters, of what the planner writes: what a campaign stores, and what the
+    # detailed channel carries on the wire (claims and verdicts carry up to ``hypothesis_chars`` of
+    # the hypothesis, never less than ``DETAIL_CHARS``; the insight line up to ``insight_chars``).
+    # The defaults are the limits every earlier arm ran with, unchanged. In snap500 the note was cut
+    # in 48 of 49 designs (median 61 % kept) because no prompt stated the limit; the v3 prompt states
+    # these, so a model writes to fit instead of being cut, and an arm can raise them.
+    note_chars: int = NOTE_CHARS
+    hypothesis_chars: int = 300
+    rationale_chars: int = 600
+    insight_chars: int = 400
+
+
+def _agency(cfg: AgentConfig) -> bool:
+    """Whether any behaviour beyond the legacy agent is on. Events only watch, so not them."""
+    return bool(
+        cfg.parts
+        or cfg.replan_on_surprise
+        or cfg.followup > 0
+        or cfg.anchors
+        or cfg.class_claims
+        or cfg.extra_rules
+        or cfg.prompt == "v3"
+        or cfg.share_signals
+    )
+
+
+#: Candidates a ``pool`` event lists, by the pick's final value.
+N_TOP = 8
 
 
 class ADKOHAgent:
@@ -205,6 +283,13 @@ class ADKOHAgent:
         if self.cfg.soft_radius > 0 and not self.cfg.skip_peer_inputs:
             raise ValueError("soft_radius discounts candidates near reported inputs, which only "
                              "skip_peer_inputs keeps; set it too")
+        if self.cfg.prompt not in ("v1", "v2", "v3"):
+            raise ValueError(f"prompt must be 'v1', 'v2' or 'v3', got {self.cfg.prompt!r}")
+        if self.cfg.followup < 0 or self.cfg.max_parts < 1 or self.cfg.max_open_tickets < 1:
+            raise ValueError("followup must be >= 0, and max_parts and max_open_tickets >= 1")
+        bad = [r for r in self.cfg.extra_rules if r in RULES]
+        if bad:
+            raise ValueError(f"extra_rules may not reuse a built-in rule's name: {bad}")
         self.space = problem.region_space
         self.planner = planner
         self.quantizer = Quantizer(self.cfg.q_bits)
@@ -258,13 +343,33 @@ class ADKOHAgent:
         #: initial points looks like the federation repeating itself.
         self._n_loaded = 0
 
+        # Agency. Row-aligned with the history above: each result's signals, its region
+        # coordinates and the round it ran (None for shared initial points). Nothing here draws
+        # a random number or changes a pick unless a config field turns it on.
+        self._agency = _agency(self.cfg)
+        self._signals: List[Dict[str, Any]] = []
+        self._F: List[Optional[np.ndarray]] = []
+        self._rounds: List[Optional[int]] = []
+        #: Follow-up tickets in the order they opened, and surprises waiting for a slot.
+        self.tickets: List[Ticket] = []
+        self._queue: List[str] = []
+        #: Surprises this agent knows of, its own and its neighbours', ``s<k>`` in arrival order.
+        self.surprises: List[Dict[str, Any]] = []
+        self._surprise_at: Dict[Tuple[Any, ...], int] = {}
+        #: Revisions waiting for the next token, and a verdict line waiting for one.
+        self._revised_out: List[Dict[str, Any]] = []
+        self._insight_out: Optional[str] = None
+        self._rule_fns: Optional[Dict[str, Any]] = None
+        self._events: List[Dict[str, Any]] = []
+        self._collect: Optional[List[Dict[str, Any]]] = None
+
     # -- shared initial data ---------------------------------------------------------------
 
     def load(self, cands: Candidates, outcomes: Sequence[Outcome]) -> None:
         """Take the shared initial points into the GP without spending budget."""
         for i, out in enumerate(outcomes):
-            key, X, _F, _meta = cands.row(i)
-            self._remember(key, X, out)
+            key, X, F, _meta = cands.row(i)
+            self._remember(key, X, out, F)
             self.surrogate.update(X, self._u[-1])
         self._n_loaded = len(self._u)
 
@@ -274,6 +379,8 @@ class ADKOHAgent:
         """Whether the driver should ask the planner for a design before this round."""
         if self.planner is None or rnd < self.cfg.warmup_rounds:
             return False
+        if self._drawing_ticket() is not None:
+            return False  # follow-up draws first; the planner then sees what they found
         return self.campaign is None or self.campaign.done
 
     def territory_region(self):
@@ -298,7 +405,7 @@ class ADKOHAgent:
             }
             for i in order
         ]
-        return {
+        ctx = {
             "agent": self.index,
             "round": rnd,
             "problem": desc,
@@ -328,6 +435,123 @@ class ADKOHAgent:
                 {**c.to_dict(self.space), "found": self._found(c)} for c in self.campaigns[-6:]
             ],
         }
+        if self.cfg.prompt == "v3":
+            ctx.update(self._context_v3(rnd, desc))
+        return ctx
+
+    def _context_v3(self, rnd: int, desc: Dict[str, Any]) -> Dict[str, Any]:
+        """What the version-3 prompt adds: the target and role, signals, surprises, tickets.
+
+        Every number here is computed from this agent's own records and what its tokens
+        brought, as for the earlier prompts; nothing a neighbour did not send appears.
+        """
+        classes = [str(c) for c in (desc.get("classes") or ())]
+        return {
+            "prompt": "v3",
+            "target": str(desc.get("target") or ""),
+            "role": _role_of(desc.get("role"), self.index),
+            "rules": list(RULES) + list(self.cfg.extra_rules),
+            "rule_notes": dict(desc.get("rule_notes") or {}),
+            "metrics": list(METRICS_V3),
+            "parts_on": self.cfg.parts,
+            "max_parts": self.cfg.max_parts if self.cfg.parts else 1,
+            "anchors": self.cfg.anchors,
+            "class_claims": self.cfg.class_claims,
+            "classes": classes,
+            "claim_classes": list(hsignals.claim_classes(classes)) if self.cfg.class_claims else [],
+            "followup": self.cfg.followup,
+            "replan_on_surprise": self.cfg.replan_on_surprise,
+            "text_limits": {"hypothesis": self.cfg.hypothesis_chars, "rationale": self.cfg.rationale_chars,
+                            "note": self.cfg.note_chars},
+            "surprises": [self._surprise_row(s) for s in self.surprises[-12:]],
+            "n_surprises": len(self.surprises),
+            "tickets": [t.to_dict(self.space) for t in self.tickets[-8:]],
+            "queued": len(self._queue),
+            "recent_v3": [
+                {**c.to_dict(self.space), "signals": self._signal_found(c.runs)}
+                for c in self.campaigns[-6:]
+            ],
+            "signal_rates": self._signal_rates(),
+        }
+
+    def _signal_found(self, runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        """What a set of runs found in signal terms: settled, pending, kinds, surprises."""
+        sigs = [r.get("signals") or {} for r in runs]
+        settled = [s for s in sigs if not hsignals.pending(s)]
+        kinds: Dict[str, int] = {}
+        for s in settled:
+            if s.get("kind"):
+                kinds[str(s["kind"])] = kinds.get(str(s["kind"]), 0) + 1
+        nov = [float(s["novelty"]) for s in settled if s.get("novelty") is not None]
+        return {
+            "spent": len(runs),
+            "settled": len(settled),
+            "pending": len(sigs) - len(settled),
+            "mismatches": sum(1 for s in settled if s.get("mismatch") is True),
+            "kinds": dict(sorted(kinds.items())),
+            "surprises": sum(1 for s in settled if hsignals.is_surprise(s)),
+            "max_novelty": round(max(nov), 4) if nov else None,
+        }
+
+    def _signal_rates(self) -> Optional[Dict[str, Any]]:
+        """Per settled experiment, over this agent's judged campaigns: what a test should beat."""
+        done = [self._signal_found(c.runs) for c in self.campaigns if c.verdict is not None]
+        n = sum(f["spent"] for f in done)
+        settled = sum(f["settled"] for f in done)
+        if not n:
+            return None
+        nov = [f["max_novelty"] for f in done if f["max_novelty"] is not None]
+        return {
+            "campaigns": len(done),
+            "experiments": n,
+            "settled": settled,
+            "pending": n - settled,
+            "mismatch_rate": (sum(f["mismatches"] for f in done) / settled) if settled else None,
+            "surprise_rate": (sum(f["surprises"] for f in done) / settled) if settled else None,
+            "mean_max_novelty": round(float(np.mean(nov)), 4) if nov else None,
+        }
+
+    def _surprise_row(self, s: Dict[str, Any]) -> Dict[str, Any]:
+        """A surprise as the prompt lists it, with its follow-up's status as it now stands."""
+        status = s.get("status")
+        if s.get("agent") != self.index:
+            status = self._peer_ticket_status(s) or status
+        return {
+            "id": s["id"],
+            "source": "mine" if s.get("agent") == self.index else f"a{s.get('agent')}",
+            "round": s.get("round"),
+            "recipe": self._recipe(s.get("F")),
+            "observed": s.get("observed"),
+            "predicted": s.get("predicted"),
+            "kind": s.get("kind"),
+            "ticket": s.get("ticket"),
+            "status": status,
+        }
+
+    def _recipe(self, F) -> str:
+        """Region coordinates as one line of ``name=value``, the planner's own vocabulary."""
+        if F is None:
+            return "(unknown)"
+        out = []
+        for d, v in zip(self.space.dims, np.asarray(F, dtype=float).ravel()):
+            if d.kind == KIND_CAT:
+                k = int(round(float(v)))
+                out.append(f"{d.name}={d.options[k] if 0 <= k < len(d.options) else k}")
+            else:
+                out.append(f"{d.name}={float(v):.4g}")
+        return " ".join(out)
+
+    def _peer_ticket_status(self, s: Dict[str, Any]) -> Optional[str]:
+        """A neighbour's surprise's follow-up status, from a ticket verdict of the same origin
+        whose box holds it -- the only way it can reach this agent."""
+        if s.get("F") is None:
+            return None
+        F = np.asarray(s["F"], dtype=float)[None, :]
+        for v in self.claims.recent_verdicts():
+            if v.origin == s.get("agent") and v.metric == "ticket" and v.status:
+                if region_of(self.space, v.region).mask(self.space, F)[0]:
+                    return v.status
+        return None
 
     def _is_hit(self, score: float) -> bool:
         t = self.cfg.hit_threshold
@@ -370,7 +594,14 @@ class ADKOHAgent:
 
         ``design`` of ``None`` means no planner: one open-ended campaign over the whole space
         with the settled rule, which is exactly ADKO v2 with a pool instead of a grid.
+
+        A design with ``parts`` (the version-3 parser's output) opens a multi-part campaign:
+        each part's region is confined to the territory on a first campaign, then widened to
+        its anchor when anchors are on, and announced as its own claim. A design without
+        ``parts`` is one part, exactly as before.
         """
+        if design is not None and isinstance(design.get("parts"), list):
+            return self._set_parts(design, rnd)
         if design is None:
             region = self.space.full()
             c = Campaign(
@@ -389,18 +620,21 @@ class ADKOHAgent:
                 region = self._intersect(region, self.territory_region())
             c = Campaign(
                 region=region,
-                rule=hrules.valid_rule(self.cfg.force_rule or design.get("rule", "adko")),
+                rule=hrules.valid_rule(self.cfg.force_rule or design.get("rule", "adko"), self.cfg.extra_rules),
                 budget=int(design.get("budget", self.cfg.default_budget)),
-                hypothesis=str(design.get("hypothesis", ""))[:300],
-                rationale=str(design.get("rationale", ""))[:600],
-                note=str(design.get("note", ""))[:NOTE_CHARS],
+                hypothesis=str(design.get("hypothesis", ""))[: self.cfg.hypothesis_chars],
+                rationale=str(design.get("rationale", ""))[: self.cfg.rationale_chars],
+                note=str(design.get("note", ""))[: self.cfg.note_chars],
                 test=design.get("test") or Test(),
                 p_success=float(design.get("p_success", 0.5)),
                 claim_id=f"a{self.index}c{len(self.campaigns)}",
                 started=rnd,
                 source=str(design.get("source", "llm")),
                 budget_range=self.cfg.budget_range,
+                extra_rules=tuple(self.cfg.extra_rules),
             )
+        if design is not None and self.cfg.class_claims:
+            c.claim = self._class_claim(design.get("claim"), [c.region], c.claim_id)
         c.baseline = self._snapshot()
         self.campaign = c
         self.campaigns.append(c)
@@ -416,20 +650,123 @@ class ADKOHAgent:
                     expires=rnd + c.budget + CLAIM_SLACK,
                     ttl=self.cfg.claim_ttl,
                     note=c.note if self.cfg.share_detail else "",
+                    predicts=c.claim["class"] if c.claim else "",
                 )
             )
+        self._opened(c, design, rnd)
         return c
+
+    def _set_parts(self, design: Dict[str, Any], rnd: int) -> Campaign:
+        """A multi-part campaign from a version-3 design: parts, anchors, a class claim."""
+        cid = f"a{self.index}c{len(self.campaigns)}"
+        raw = [p for p in design["parts"] if isinstance(p, dict)]
+        raw = raw[: self.cfg.max_parts if self.cfg.parts else 1]
+        if not raw:  # nothing usable in parts: the design's own region, as one part
+            raw = [{"region": design.get("region"), "rule": design.get("rule"),
+                    "n": design.get("budget", self.cfg.default_budget)}]
+        parts, dropped = [], []
+        for j, p in enumerate(raw):
+            region = p.get("region") or self.space.full()
+            if self.cfg.territory and not self.campaigns:
+                region = self._intersect(region, self.territory_region())
+            anchor = p.get("anchor") if self.cfg.anchors else None
+            if anchor:
+                found = self._surprise_by_id(str(anchor))
+                if found is None or found.get("F") is None:
+                    dropped.append(str(anchor))
+                    anchor = None
+                else:
+                    region = self.space.widen(region, found["F"])
+            rule = hrules.valid_rule(
+                self.cfg.force_rule or p.get("rule", "explore"), self.cfg.extra_rules, default="explore"
+            )
+            parts.append(Part(region=region, rule=rule, n=int(p.get("n", 1) or 1),
+                              anchor=str(anchor) if anchor else None, claim_id=f"{cid}p{j}"))
+        c = Campaign(
+            region=parts[0].region,
+            rule=parts[0].rule,
+            parts=parts,
+            hypothesis=str(design.get("hypothesis", ""))[: self.cfg.hypothesis_chars],
+            rationale=str(design.get("rationale", ""))[: self.cfg.rationale_chars],
+            note=str(design.get("note", ""))[: self.cfg.note_chars],
+            test=design.get("test") or Test(),
+            p_success=float(design.get("p_success", 0.5)),
+            claim_id=cid,
+            started=rnd,
+            source=str(design.get("source", "llm")),
+            budget_range=self.cfg.budget_range,
+            extra_rules=tuple(self.cfg.extra_rules),
+            anchors_dropped=dropped,
+        )
+        if self.cfg.class_claims:
+            c.claim = self._class_claim(design.get("claim"), [p.region for p in c.parts], cid)
+        c.baseline = self._snapshot()
+        self.campaign = c
+        self.campaigns.append(c)
+        if self.cfg.claims_on:
+            for j, part in enumerate(c.parts):
+                self.claims.announce(
+                    Claim(
+                        origin=self.index,
+                        claim_id=part.claim_id,
+                        region=part.region.pack(self.space),
+                        rule=part.rule,
+                        hypothesis=self._claim_text(c),
+                        round=rnd,
+                        expires=rnd + c.budget + CLAIM_SLACK,
+                        ttl=self.cfg.claim_ttl,
+                        note=c.note if self.cfg.share_detail else "",
+                        predicts=c.claim["class"] if c.claim and c.claim["part"] == j else "",
+                    )
+                )
+        self._opened(c, design, rnd)
+        return c
+
+    def _class_claim(self, raw: Any, regions: Sequence[Any], cid: str) -> Optional[Dict[str, Any]]:
+        """A design's class claim, kept only if it names a real part and a known class."""
+        if not isinstance(raw, dict):
+            return None
+        try:
+            j = int(raw.get("part", 0))
+        except (TypeError, ValueError):
+            return None
+        cls = str(raw.get("class", ""))
+        allowed = hsignals.claim_classes(self.problem.describe().get("classes") or ())
+        if not 0 <= j < len(regions) or cls not in allowed:
+            return None
+        return {"part": j, "class": cls, "claim_id": f"{cid}p{j}"}
+
+    def _opened(self, c: Campaign, design: Optional[Dict[str, Any]], rnd: int) -> None:
+        if not self._watching():
+            return
+        self._emit(
+            "campaign_open",
+            rnd,
+            claim_id=c.claim_id,
+            source=c.source,
+            region=c.footprint(self.space).label(self.space),
+            parts=[p.to_dict(self.space) for p in c.parts],
+            claim=dict(c.claim) if c.claim else None,
+            budget=c.budget,
+            test=c.test.to_dict(),
+            p_success=c.p_success,
+            hypothesis=c.hypothesis,
+            rationale=c.rationale,
+            note=c.note,
+            anchors_dropped=list(c.anchors_dropped),
+            **({"workspace": design["workspace_log"]} if design and "workspace_log" in design else {}),
+        )
 
     def _verdict_chars(self) -> int:
         """How much of the hypothesis a verdict carries, by channel width."""
         if self.cfg.share_detail:
-            return DETAIL_CHARS
+            return max(DETAIL_CHARS, int(self.cfg.hypothesis_chars))
         return VERDICT_CHARS if self.cfg.share_text else 80
 
     def _claim_text(self, c: Campaign) -> str:
         """The hypothesis a claim carries: nothing, a truncation, or all of it."""
         if self.cfg.share_detail:
-            return c.hypothesis[:DETAIL_CHARS]
+            return c.hypothesis[: max(DETAIL_CHARS, int(self.cfg.hypothesis_chars))]
         return c.hypothesis[:CLAIM_CHARS] if self.cfg.share_text else ""
 
     def _hit_box(self, c: Campaign):
@@ -476,7 +813,13 @@ class ADKOHAgent:
         ``taken`` are keys already claimed by another agent this round. Nothing is evaluated
         twice in a round, as the reference comparisons require, and the exclusion happens in
         the pool draw so the rule never sees a point it cannot have.
+
+        While a follow-up ticket has draws left, the pick is its next draw instead and the
+        campaign waits.
         """
+        ticket = self._drawing_ticket()
+        if ticket is not None:
+            return self._followup_pick(ticket, rnd, taken)
         warm = rnd < self.cfg.warmup_rounds
         if not warm and self.campaign is None:
             self.set_campaign(
@@ -509,6 +852,42 @@ class ADKOHAgent:
             self.diag["skipped"] = skipped
         key, X, F, meta = cands.row(i)
         return Pick(agent=self.index, key=key, X=X, F=F, meta=meta, rule=rule, claim_id=claim_id)
+
+    def _followup_pick(self, t: Ticket, rnd: int, taken: Sequence[int]) -> Pick:
+        """A ticket's draw: the unrun candidate nearest the surprise, inside the ticket's box.
+
+        Distances are taken in the unit cube of the region coordinates, the units the box is
+        drawn in. The pool comes from the problem as any other, so a box the pool cannot fill
+        is topped up from anywhere and the nearest candidate still wins.
+        """
+        exclude = sorted(self._keys | {int(k) for k in taken})
+        cands = self.problem.pool(self.rng, self.cfg.pool_size, exclude, t.region)
+        skipped = 0
+        if self.cfg.skip_peer_inputs and (self._peer_X or self._relayed_X):
+            cands, skipped = self._skip_reported(cands, exclude, t.region)
+        self._cands = cands
+        if len(cands) == 0:
+            raise RuntimeError(f"{self.problem.problem_id}: empty candidate pool at round {rnd}")
+        mask = t.region.mask(self.space, cands.F)
+        origin = self.space.normalize(np.asarray(t.F, dtype=float)[None, :])[0]
+        d = np.sqrt(((self.space.normalize(cands.F) - origin) ** 2).sum(axis=1))
+        i = hrules.pick(-d, mask)
+        self.diag = {
+            "mode": "followup",
+            "rule": "followup",
+            "ticket": t.id,
+            "pool": len(cands),
+            "in_region": int(np.count_nonzero(mask)),
+            "region_empty": not bool(mask.any()),
+            "distance": round(float(d[i]), 6),
+        }
+        if self.cfg.skip_peer_inputs:
+            self.diag["skipped"] = skipped
+        if self._watching():
+            mu, sigma = self.surrogate.predict(cands.X)
+            self._pool_event(rnd, "followup", None, cands, -d, mu, sigma, mask, i)
+        key, X, F, meta = cands.row(i)
+        return Pick(agent=self.index, key=key, X=X, F=F, meta=meta, rule="followup", claim_id=t.id)
 
     def _skip_reported(self, cands: Candidates, exclude: Sequence[int], region) -> Tuple[Candidates, int]:
         """Drop candidates a neighbour's token shows were already run; top the pool back up.
@@ -549,7 +928,13 @@ class ADKOHAgent:
         G, L = cal.apply(G0, P0)
         self.sigma_ref = float(sigma.max())
         nov = hrules.nearest_distance(cands.X, self._known_inputs())
-        v = hrules.values(c.rule, mu, sigma, G, L, nov, beta=w.beta, lam=w.lam, gamma=w.gamma)
+        rule_error = None
+        if c.rule in self.cfg.extra_rules:
+            v, rule_error = self._problem_rule(c, cands, mask, mu, sigma, rnd, nov)
+            if rule_error is not None:
+                v = hrules.values("explore", mu, sigma, G, L, nov, beta=w.beta, lam=w.lam, gamma=w.gamma)
+        else:
+            v = hrules.values(c.rule, mu, sigma, G, L, nov, beta=w.beta, lam=w.lam, gamma=w.gamma)
         pen = self.claims.penalty(cands.F, rnd) if self.cfg.claims_on else None
         v, parts = hrules.adjust(
             v,
@@ -587,18 +972,96 @@ class ADKOHAgent:
             **{f"term_{k}": round(float(x), 6) for k, x in parts.items()},
             **{k: cal.diagnostics[k] for k in ("k", "U", "floor_active")},
         }
+        if c.multipart:
+            self.diag["part"] = c.part_index
+        if rule_error is not None:
+            self.diag["rule_error"] = rule_error
+            self._emit("rule_error", rnd, rule=c.rule, claim_id=c.claim_id, error=rule_error)
+        if self._watching():
+            self._pool_event(rnd, c.rule, c.part_index, cands, v, mu, sigma, mask, i)
         return i
 
+    def _problem_rule(self, c: Campaign, cands: Candidates, mask, mu, sigma, rnd: int, nov):
+        """A problem-supplied rule's values, or ``(None, why)`` if it cannot be used this pick.
+
+        Anything a rule can get wrong -- raising, the wrong shape, nothing finite -- costs this
+        pick its rule and nothing more: the caller falls back to ``explore`` and records why.
+        NaN is read as the worst value.
+        """
+        if self._rule_fns is None:
+            get = getattr(self.problem, "rules", None)
+            self._rule_fns = dict(get() or {}) if callable(get) else {}
+        fn = self._rule_fns.get(c.rule)
+        if fn is None:
+            return None, f"the problem supplies no rule {c.rule!r}"
+        view = RuleView(
+            agent=self.index,
+            round=int(rnd),
+            rule=c.rule,
+            part=c.part_index,
+            cands=cands,
+            mask=np.asarray(mask, dtype=bool),
+            mu=np.asarray(mu, dtype=float),
+            sigma=np.asarray(sigma, dtype=float),
+            own_X=np.asarray(self._X, dtype=float) if self._X else np.zeros((0, np.shape(cands.X)[1])),
+            own_F=_rows(self._F, len(self.space)),
+            own_u=np.asarray(self._u, dtype=float),
+            own_signals=[dict(s) for s in self._signals],
+            own_families=list(self._fams),
+            known_inputs=self._known_inputs(),
+            seed=int(np.random.SeedSequence([self.seed, self.index, int(rnd), 4049]).generate_state(1)[0]),
+            region=c.region,
+            own_descriptors=_rows([z if z.size else None for z in self._desc],
+                                  int(self.problem.descriptor_dim() or 0)),
+            known_descriptors=self._descriptors(),
+        )
+        try:
+            v = np.asarray(fn(view), dtype=float)
+        except Exception as e:  # noqa: BLE001 -- the problem's code, not ours: any failure is one pick's
+            return None, f"{type(e).__name__}: {e}"[:200]
+        if v.shape != (len(cands),):
+            return None, f"returned shape {v.shape}, expected ({len(cands)},)"
+        v = np.where(np.isnan(v), -np.inf, v)
+        if not np.isfinite(v).any():
+            return None, "returned no finite value"
+        return v, None
+
+    def _pool_event(self, rnd, rule, part, cands, v, mu, sigma, mask, i) -> None:
+        """The pick's top candidates by final value, and the one chosen, for the ledger."""
+        v = np.asarray(v, dtype=float)
+        order = np.argsort(-np.where(np.isfinite(v), v, -np.inf), kind="stable")[:N_TOP]
+
+        def row(j):
+            return {
+                "key": int(cands.key[j]),
+                "value": _finite(v[j]),
+                "mu": _finite(mu[j]),
+                "sigma": _finite(sigma[j]),
+                "in_region": bool(mask[j]),
+            }
+
+        self._emit("pool", rnd, rule=rule, part=part, pool=len(cands),
+                   top=[row(int(j)) for j in order], chosen=row(int(i)))
+
     def complete(self, pick: Pick, out: Outcome, rnd: int) -> HToken:
-        """Record the result, close the campaign if this was its last experiment, emit a token."""
-        c = self.campaign
+        """Record the result, close the campaign if this was its last experiment, emit a token.
+
+        A follow-up draw (rule ``followup``) counts for its ticket, not for the campaign, which
+        waits for it. With agency on, a surprise then opens a ticket and may close the
+        campaign early, and tickets whose draws have all settled are judged.
+        """
+        sig = dict(getattr(out, "signals", None) or {})
+        ticket = self._ticket(pick.claim_id) if pick.rule == "followup" else None
+        c = self.campaign if ticket is None else None
         last = c.last if c is not None else False
-        self._remember(pick.key, pick.X, out)
+        self._remember(pick.key, pick.X, out, pick.F, rnd)
         self.surrogate.update(pick.X, self._u[-1])
-        verdicts: List[Verdict] = []
         insight = None
-        if c is not None:
-            c.runs.append(
+        if ticket is not None:
+            ticket.spent += 1
+            ticket.runs.append({"round": rnd, "key": int(pick.key), **({"signals": sig} if sig else {})})
+        elif c is not None:
+            c.add_run(
                 {
                     "round": rnd,
                     "key": int(pick.key),
@@ -613,41 +1076,20 @@ class ADKOHAgent:
                         if self.cfg.share_detail
                         else {}
                     ),
+                    **({"signals": dict(sig)} if sig else {}),
                 }
             )
             if last or c.done:
-                v = c.judge(self._evidence(c))
-                insight = self._insight(c, v)
-                if self.cfg.claims_on:
-                    found = self._found(c) if self.cfg.share_hits else None
-                    verdict = Verdict(
-                        origin=self.index,
-                        claim_id=c.claim_id,
-                        region=c.region.pack(self.space),
-                        metric=v["metric"],
-                        value=v["value"],
-                        op=v["op"],
-                        threshold=v["threshold"],
-                        success=v["success"],
-                        hypothesis=c.hypothesis[: self._verdict_chars()],
-                        round=rnd,
-                        ttl=self.cfg.verdict_ttl,
-                        note=c.note if self.cfg.share_detail else "",
-                        hit_box=self._hit_box(c) if self.cfg.share_detail else None,
-                        **(
-                            {}
-                            if found is None
-                            else {
-                                "spent": found["spent"],
-                                "hits": found["hits"],
-                                "hit_families": found["new_hit_families"],
-                                "best": found["best"],
-                            }
-                        ),
-                    )
-                    self.claims.settle(verdict)
-                if self.planner is not None:
-                    getattr(self.planner, "record_outcome", lambda *a, **k: None)(c, v)
+                # A campaign already closed (early, by a surprise) is not judged twice.
+                if not (self._agency and c.verdict is not None):
+                    insight = self._close(c, rnd)
+        if self._agency:
+            self._noticed(len(self._u) - 1, rnd, ticket)
+            self._open_tickets(rnd)
+            self._check_tickets(rnd)
+            if insight is None and self._insight_out:
+                insight = self._insight_out
+            self._insight_out = None
         claims_out, verdicts_out = self.claims.outbox() if self.cfg.claims_on else ([], [])
         x_shared = self.problem.privatize(pick.X, self.token_rng)
         if self.cfg.token_noise > 0:
@@ -656,6 +1098,11 @@ class ADKOHAgent:
         if self.cfg.input_hops > 1:
             self._seen_inputs.add(_input_key(x_shared))  # my own run, if it comes back to me
             relayed, self._relay_out = self._relay_out, []
+        bits: Dict[str, Any] = {}
+        revised: List[Dict[str, Any]] = []
+        if self.cfg.share_signals:
+            bits = self._bits(sig, pick.F)
+            revised, self._revised_out = self._revised_out, []
         tok = encode(
             agent_id=self.agent_id,
             source=self.index,
@@ -671,6 +1118,8 @@ class ADKOHAgent:
             claims=claims_out,
             verdicts=verdicts_out,
             relayed=relayed,
+            signals=bits,
+            revised=revised,
         )
         self.records.append(
             {
@@ -687,9 +1136,366 @@ class ADKOHAgent:
                 "trust": None if self.trust is None else self.trust.mean(),
                 **{f"d_{k}": x for k, x in self.diag.items()},
                 **({"extras": out.extras} if out.extras else {}),
+                **({"signals": sig} if sig else {}),
             }
         )
+        if self._watching():
+            self._emit(
+                "token_sent",
+                rnd,
+                key=int(pick.key),
+                bits=tok.payload_bits(),
+                family=tok.family,
+                kind=sig.get("kind"),
+                mismatch=sig.get("mismatch"),
+                surprise=hsignals.is_surprise(sig),
+                signals=dict(tok.signals),
+                claims=[m.claim_id for m in claims_out],
+                verdicts=[m.claim_id for m in verdicts_out],
+                relayed=len(relayed),
+                revised=len(revised),
+            )
         return tok
+
+    def _bits(self, sig: Dict[str, Any], F) -> Dict[str, Any]:
+        """A result's signal bits for the wire; a surprise also says where it sat."""
+        bits = hsignals.on_token(sig)
+        if hsignals.is_surprise(sig) and F is not None:
+            bits["at"] = [round(float(v), 4) for v in np.ravel(F)]
+        return bits
+
+    def _close(self, c: Campaign, rnd: int, early: Optional[str] = None) -> str:
+        """Judge a campaign, send its verdict (and its class claim's status), tell the planner.
+
+        Returns the one-line insight the token carries.
+        """
+        v = c.judge(self._evidence(c), early=early)
+        insight = self._insight(c, v)
+        if self.cfg.claims_on:
+            found = self._found(c) if self.cfg.share_hits else None
+            verdict = Verdict(
+                origin=self.index,
+                claim_id=c.claim_id,
+                region=c.footprint(self.space).pack(self.space),
+                metric=v["metric"],
+                value=v["value"],
+                op=v["op"],
+                threshold=v["threshold"],
+                success=v["success"],
+                hypothesis=c.hypothesis[: self._verdict_chars()],
+                round=rnd,
+                ttl=self.cfg.verdict_ttl,
+                note=c.note if self.cfg.share_detail else "",
+                hit_box=self._hit_box(c) if self.cfg.share_detail else None,
+                **(
+                    {}
+                    if found is None
+                    else {
+                        "spent": found["spent"],
+                        "hits": found["hits"],
+                        "hit_families": found["new_hit_families"],
+                        "best": found["best"],
+                    }
+                ),
+            )
+            self.claims.settle(verdict)
+            if c.claim is not None:
+                self.claims.settle(self._claim_verdict(c, rnd))
+        if self.planner is not None:
+            getattr(self.planner, "record_outcome", lambda *a, **k: None)(c, v)
+        if self._watching():
+            self._emit("campaign_verdict", rnd, claim_id=c.claim_id, verdict=dict(v),
+                       brier=c.brier(), early=c.early)
+            if c.claim is not None:
+                self._emit("claim_status", rnd, campaign=c.claim_id, **dict(c.claim))
+        return insight
+
+    def _claim_verdict(self, c: Campaign, rnd: int) -> Verdict:
+        """A class claim's status as a verdict on the claim of its part."""
+        cl = c.claim
+        share = cl["shows"] / cl["settled"] if cl.get("settled") else None
+        return Verdict(
+            origin=self.index,
+            claim_id=cl["claim_id"],
+            region=c.parts[cl["part"]].region.pack(self.space),
+            metric="class_claim",
+            value=None if share is None else round(float(share), 6),
+            op=">=",
+            threshold=0.5,
+            success=cl["status"] == "supported",
+            hypothesis=c.hypothesis[: self._verdict_chars()],
+            round=rnd,
+            ttl=self.cfg.verdict_ttl,
+            predicts=cl["class"],
+            status=cl["status"],
+        )
+
+    # -- surprises, tickets, late labels ---------------------------------------------------
+
+    def _noticed(self, i: int, rnd: int, ticket: Optional[Ticket]) -> None:
+        """What a surprise sets off, from ``complete`` or ``revise`` alike.
+
+        It is listed (once per result) for the planner. A ticket's own draw counts for that
+        ticket and sets off nothing more, or a region full of surprises would follow itself up
+        forever; any other surprise queues a ticket (``followup``) and closes the open campaign
+        early (``replan_on_surprise``).
+        """
+        if not hsignals.is_surprise(self._signals[i]):
+            return
+        s, new = self._own_surprise(i)
+        if not new:
+            return
+        if ticket is not None:
+            s["ticket"], s["status"] = ticket.id, "follow-up draw"
+            return
+        if self.cfg.followup > 0 and s.get("F") is not None:
+            self._queue.append(s["id"])
+            s["status"] = "queued"
+        if self.cfg.replan_on_surprise:
+            self._close_early(rnd)
+
+    def _close_early(self, rnd: int) -> None:
+        """Close the open campaign on its runs so far; the planner is asked again next."""
+        c = self.campaign
+        if c is None or c.done or c.verdict is not None or c.source == "none":
+            return
+        self._insight_out = self._close(c, rnd, early="surprise")
+
+    def _own_surprise(self, i: int) -> Tuple[Dict[str, Any], bool]:
+        key = ("own", int(self._keylist[i]))
+        if key in self._surprise_at:
+            return self.surprises[self._surprise_at[key]], False
+        sig = self._signals[i]
+        F = self._F[i]
+        s = {
+            "id": f"s{len(self.surprises)}",
+            "agent": self.index,
+            "round": self._rounds[i],
+            "key": int(self._keylist[i]),
+            "F": None if F is None else [float(v) for v in F],
+            "observed": sig.get("observed"),
+            "predicted": sig.get("predicted"),
+            "kind": sig.get("kind"),
+            "novelty": sig.get("novelty"),
+            "ticket": None,
+            "status": None,
+        }
+        self._surprise_at[key] = len(self.surprises)
+        self.surprises.append(s)
+        return s, True
+
+    def _peer_surprise(self, source: int, rnd: int, bits: Dict[str, Any]) -> None:
+        """A neighbour's surprise, from its token or a revision it sent: listed, never followed up."""
+        key = ("peer", int(source), int(rnd))
+        if key in self._surprise_at:
+            return
+        at = bits.get("at")
+        self._surprise_at[key] = len(self.surprises)
+        self.surprises.append(
+            {
+                "id": f"s{len(self.surprises)}",
+                "agent": int(source),
+                "round": int(rnd),
+                "key": None,
+                "F": None if at is None else [float(v) for v in at],
+                "observed": None,
+                "predicted": None,
+                "kind": bits.get("kind"),
+                "novelty": None,
+                "ticket": None,
+                "status": None,
+            }
+        )
+
+    def _surprise_by_id(self, sid: str) -> Optional[Dict[str, Any]]:
+        for s in self.surprises:
+            if s["id"] == sid:
+                return s
+        return None
+
+    def _drawing_ticket(self) -> Optional[Ticket]:
+        """The first ticket with draws left (first in, first out), if any."""
+        for t in self.tickets:
+            if t.drawing:
+                return t
+        return None
+
+    def _ticket(self, tid: str) -> Optional[Ticket]:
+        for t in self.tickets:
+            if t.id == tid:
+                return t
+        return None
+
+    def _open_tickets(self, rnd: int) -> None:
+        """Give queued surprises a ticket while fewer than ``max_open_tickets`` are drawing.
+
+        A ticket whose draws are spent but not yet settled does not hold a slot: a label that
+        never settles would otherwise block every later surprise.
+        """
+        while self._queue and sum(1 for t in self.tickets if t.drawing) < self.cfg.max_open_tickets:
+            s = self._surprise_by_id(self._queue.pop(0))
+            if s is None or s.get("F") is None:
+                continue
+            centre = self.space.normalize(np.asarray(s["F"], dtype=float)[None, :])[0]
+            t = Ticket(
+                id=f"a{self.index}t{len(self.tickets)}",
+                surprise=s["id"],
+                origin_key=int(s["key"]),
+                F=list(s["F"]),
+                kind=str(s.get("kind") or ""),
+                draws=int(self.cfg.followup),
+                region=self.space.box_around(centre, self.cfg.followup_half_width),
+                opened=rnd,
+            )
+            self.tickets.append(t)
+            s["ticket"], s["status"] = t.id, "open"
+            self._emit("ticket_open", rnd, ticket=t.id, surprise=t.surprise, origin_key=t.origin_key,
+                       recipe=self._recipe(t.F), F=list(t.F), kind=t.kind, draws=t.draws,
+                       region=t.region.label(self.space))
+
+    def _check_tickets(self, rnd: int, final: bool = False) -> None:
+        """Close every ticket that can be closed; its status travels as a verdict."""
+        for t in self.tickets:
+            if t.status is not None:
+                continue
+            st = t.outcome(final)
+            if st is None:
+                continue
+            t.status, t.closed = st, int(rnd)
+            s = self._surprise_by_id(t.surprise)
+            if s is not None:
+                s["status"] = st
+            if self.cfg.claims_on:
+                self.claims.settle(
+                    Verdict(
+                        origin=self.index,
+                        claim_id=t.id,
+                        region=t.region.pack(self.space),
+                        metric="ticket",
+                        value=float(t.reproduced()),
+                        op=">=",
+                        threshold=1.0,
+                        success=st == "reproduced",
+                        hypothesis=f"follow-up of {t.surprise} ({t.kind})"[: self._verdict_chars()],
+                        round=int(rnd),
+                        ttl=self.cfg.verdict_ttl,
+                        predicts=t.kind,
+                        status=st,
+                    )
+                )
+            self._emit("ticket_close", rnd, **t.to_dict(self.space),
+                       keys=[int(r["key"]) for r in t.runs], final=bool(final))
+
+    def revise(self, key: int, outcome: Outcome, rnd: int) -> List[Dict[str, Any]]:
+        """A pending result of this agent settled: replace its score, family, descriptor, signals.
+
+        The GP is refit on the corrected history, the run entry of whichever campaign (or
+        ticket) holds the point is updated, and a revised surprise sets off what it would have
+        in :meth:`complete` (a ticket, an early close). A campaign already judged keeps its
+        verdict -- it was judged on what was known then -- and tokens already sent are not
+        recalled; with ``share_signals`` the next token carries the revision. Call it between
+        rounds, before planning (see the module notes); the same revisions at the same rounds
+        give the same picks.
+
+        Returns this call's events (``label_revision`` first), whether or not
+        ``AgentConfig.events`` is on; with it on they are also in :meth:`drain_events`.
+        """
+        self._collect = []
+        try:
+            i = self._index_of(key)
+            if i is None:
+                raise KeyError(f"agent {self.index} ran no point with key {key}")
+            sig = dict(getattr(outcome, "signals", None) or {})
+            old = {"score": self._score_at(i), "family": self._fams[i], "signals": dict(self._signals[i])}
+            self._u[i] = float(outcome.score) if self.problem.maximize else -float(outcome.score)
+            self._fams[i] = str(outcome.family or "")
+            z = np.asarray(outcome.descriptor, dtype=float).ravel()
+            if z.size:
+                self._desc[i] = z
+            self._signals[i] = sig
+            refit = getattr(self.surrogate, "refit", None)
+            if callable(refit):
+                refit(self._X, self._u)
+            holder, judged, ticket = None, None, None
+            for c in self.campaigns:
+                for r in c.runs:
+                    if int(r["key"]) == int(key):
+                        r["score"] = round(float(outcome.score), 6)
+                        r["family"] = outcome.family
+                        _set_signals(r, sig)
+                        holder, judged = c.claim_id, c.verdict is not None
+            for t in self.tickets:
+                for r in t.runs:
+                    if int(r["key"]) == int(key):
+                        _set_signals(r, sig)
+                        ticket = t
+            self._emit(
+                "label_revision",
+                rnd,
+                key=int(key),
+                ran=self._rounds[i],
+                old=old,
+                new={"score": float(outcome.score), "family": self._fams[i], "signals": dict(sig)},
+                campaign=holder,
+                judged=judged,
+                ticket=None if ticket is None else ticket.id,
+                surprise=hsignals.is_surprise(sig),
+                refit=callable(refit),
+            )
+            if self.cfg.share_signals:
+                fam = self._fams[i] if self.cfg.share_family else ""
+                self._revised_out.append(
+                    {"r": self._rounds[i], **({"family": fam} if fam else {}), **self._bits(sig, self._F[i])}
+                )
+            self._noticed(i, rnd, ticket)
+            self._open_tickets(rnd)
+            self._check_tickets(rnd)
+            return self._collect
+        finally:
+            self._collect = None
+
+    def finish(self, rnd: int) -> List[Dict[str, Any]]:
+        """The run is over: close every ticket still open on what is known now.
+
+        Returns this call's events (``ticket_close``), as :meth:`revise` does.
+        """
+        self._collect = []
+        try:
+            self._check_tickets(rnd, final=True)
+            return self._collect
+        finally:
+            self._collect = None
+
+    def drain_events(self) -> List[Dict[str, Any]]:
+        """Every event since the last call, oldest first, and clear them.
+
+        Each is ``{"type", "agent", "round", ...}``. Collected only with
+        ``AgentConfig.events``; otherwise this is always empty and nothing was built.
+        """
+        out, self._events = self._events, []
+        return out
+
+    def _watching(self) -> bool:
+        return self.cfg.events or self._collect is not None
+
+    def _emit(self, _type: str, _round: int, **fields) -> None:
+        if not self._watching():
+            return
+        ev = {"type": _type, "agent": self.index, "round": int(_round), **fields}
+        if self.cfg.events:
+            self._events.append(ev)
+        if self._collect is not None:
+            self._collect.append(ev)
+
+    def _index_of(self, key: int) -> Optional[int]:
+        """Where an own result sits in the history (shared initial points are not this agent's)."""
+        for i in range(len(self._keylist) - 1, self._n_loaded - 1, -1):
+            if self._keylist[i] == int(key):
+                return i
+        return None
+
+    def _score_at(self, i: int) -> float:
+        return float(self._u[i]) if self.problem.maximize else -float(self._u[i])
 
     def _insight(self, c: Campaign, v: Dict[str, Any]) -> str:
         """The one line that leaves with the campaign's last result: claim, reason, outcome."""
@@ -697,17 +1503,20 @@ class ADKOHAgent:
         return (
             f"{c.hypothesis or '(no hypothesis)'} | why: {c.rationale or '(none)'} | "
             f"{'held' if v['success'] else 'failed'} ({v['metric']}={val} vs {v['op']} {v['threshold']:g})"
-        )[:400]
+        )[: self.cfg.insight_chars]
 
     # -- bookkeeping -----------------------------------------------------------------------
 
-    def _remember(self, key: int, X: np.ndarray, out: Outcome) -> None:
+    def _remember(self, key: int, X: np.ndarray, out: Outcome, F=None, rnd: Optional[int] = None) -> None:
         self._keys.add(int(key))
         self._keylist.append(int(key))
         self._X.append(np.asarray(X, dtype=float))
         self._u.append(float(out.score) if self.problem.maximize else -float(out.score))
         self._desc.append(np.asarray(out.descriptor, dtype=float).ravel())
         self._fams.append(str(out.family or ""))
+        self._signals.append(dict(getattr(out, "signals", None) or {}))
+        self._F.append(None if F is None else np.asarray(F, dtype=float).ravel())
+        self._rounds.append(None if rnd is None else int(rnd))
 
     @property
     def own_picks(self) -> List[np.ndarray]:
@@ -743,6 +1552,8 @@ class ADKOHAgent:
 
     def _evidence(self, c: Campaign) -> Evidence:
         """The campaign's own runs against the snapshot taken when it opened."""
+        if self._agency:
+            return self._evidence_keyed(c)
         n = len(c.runs)
         mine = self._descriptors(include_peers=False)
         Z = mine[-n:] if n and len(mine) >= n else np.zeros((0, 0))
@@ -760,6 +1571,41 @@ class ADKOHAgent:
             hull_after=hmetrics.hull_volume(after),
             hit_threshold=self.cfg.hit_threshold,
             maximize=self.problem.maximize,
+        )
+
+    def _evidence_keyed(self, c: Campaign) -> Evidence:
+        """The campaign's runs found by key, its pending ones kept out of every count.
+
+        With follow-up draws between a campaign's runs and labels revised after the fact, its
+        runs are no longer the last ``n`` of the history, so descriptors are looked up by key.
+        (The legacy path, :meth:`_evidence`, keeps the tail it always used.)
+        """
+        at = {k: i for i, k in enumerate(self._keylist)}
+        sigs = [dict(r.get("signals") or {}) for r in c.runs]
+        keep = [j for j, sg in enumerate(sigs) if not hsignals.pending(sg)]
+        rows = [self._desc[at[int(c.runs[j]["key"])]] for j in keep if int(c.runs[j]["key"]) in at]
+        rows = [z for z in rows if z.size]
+        if rows:
+            d = max(len(z) for z in rows)
+            Z = np.asarray([z for z in rows if len(z) == d], dtype=float)
+        else:
+            Z = np.zeros((0, 0))
+        base = c.baseline.get("known_descriptors", np.zeros((0, 0)))
+        after = np.vstack([base, Z]) if base.size and Z.size and base.shape[1] == Z.shape[1] else (
+            Z if Z.size else base
+        )
+        return Evidence(
+            scores=np.asarray([c.runs[j]["score"] for j in keep], dtype=float),
+            descriptors=Z,
+            families=[c.runs[j]["family"] for j in keep],
+            known_descriptors=base,
+            known_families=set(c.baseline.get("known_families", set())),
+            hull_before=float(c.baseline.get("hull", 0.0)),
+            hull_after=hmetrics.hull_volume(after),
+            hit_threshold=self.cfg.hit_threshold,
+            maximize=self.problem.maximize,
+            signals=sigs,
+            parts=[int(r.get("part", 0)) for r in c.runs],
         )
 
     def _jitter(self, x) -> np.ndarray:
@@ -801,11 +1647,53 @@ class ADKOHAgent:
             fam = getattr(t, "family", "")
             if fam:
                 self._peer_fams.add(fam)
-        if self.cfg.claims_on:
+        if self._watching():
+            self._received(peers)
+        elif self.cfg.claims_on:
             self.claims.ingest(
                 [c for t in peers for c in getattr(t, "claims", [])],
                 [v for t in peers for v in getattr(t, "verdicts", [])],
             )
+        for t in peers:
+            self._take_signals(t)
+
+    def _received(self, peers: Sequence[HToken]) -> None:
+        """Ingest token by token, so each ``token_received`` event can say what it brought.
+
+        The same claims and verdicts in the same order as one batched ingest: claims and
+        verdicts are kept apart, so interleaving them by token changes nothing.
+        """
+        for t in peers:
+            tot = self.claims.totals
+            n0 = (tot["claims_in"], tot["claims_new"], tot["verdicts_in"], tot["verdicts_new"])
+            claims, verdicts = list(getattr(t, "claims", [])), list(getattr(t, "verdicts", []))
+            if self.cfg.claims_on:
+                self.claims.ingest(claims, verdicts)
+            n_in = tot["claims_in"] - n0[0] + tot["verdicts_in"] - n0[2]
+            n_new = tot["claims_new"] - n0[1] + tot["verdicts_new"] - n0[3]
+            self._emit(
+                "token_received",
+                t.round,
+                sender=int(t.source),
+                family=getattr(t, "family", ""),
+                signals=dict(getattr(t, "signals", None) or {}),
+                claims=[m.claim_id for m in claims],
+                verdicts=[m.claim_id for m in verdicts],
+                accepted=int(n_new),
+                skipped=int(n_in - n_new) if self.cfg.claims_on else len(claims) + len(verdicts),
+                revised=len(getattr(t, "revised", None) or []),
+            )
+
+    def _take_signals(self, t: HToken) -> None:
+        """A neighbour's signal bits: its surprises join the list, its revised families the set."""
+        bits = getattr(t, "signals", None) or {}
+        if bits.get("surprise") is True:
+            self._peer_surprise(t.source, t.round, bits)
+        for r in getattr(t, "revised", None) or []:
+            if r.get("family"):
+                self._peer_fams.add(str(r["family"]))
+            if r.get("surprise") is True and r.get("r") is not None:
+                self._peer_surprise(t.source, int(r["r"]), r)
 
     def _take_relay(self, t: HToken) -> None:
         """Note a neighbour's input and the inputs it relayed; queue what may travel further."""
@@ -865,7 +1753,48 @@ class ADKOHAgent:
             "trust": None if self.trust is None else self.trust.snapshot(),
             "records": self.records,
             **({"relayed_inputs": len(self._relayed_X)} if self.cfg.input_hops > 1 else {}),
+            **(
+                {
+                    "tickets": [t.to_dict(self.space) for t in self.tickets],
+                    "surprises": [self._surprise_row(s) for s in self.surprises],
+                }
+                if self._agency
+                else {}
+            ),
         }
+
+
+def _role_of(role: Any, index: int) -> str:
+    """An agent's role from ``describe()["role"]``: one text, a sequence, or a mapping."""
+    if role is None:
+        return ""
+    if isinstance(role, str):
+        return role
+    if isinstance(role, dict):
+        return str(role.get(index, role.get(str(index), "")))
+    seq = list(role)
+    return str(seq[index % len(seq)]) if seq else ""
+
+
+def _rows(rows: Sequence[Optional[np.ndarray]], width: int) -> np.ndarray:
+    """Row-aligned vectors as one array; a missing row is NaN, so alignment is kept."""
+    if not rows:
+        return np.zeros((0, width))
+    w = max([len(r) for r in rows if r is not None] or [width])
+    return np.asarray([np.full(w, np.nan) if r is None else r for r in rows], dtype=float)
+
+
+def _finite(x) -> Optional[float]:
+    """A float for a JSON record; ``None`` for inf or NaN, which strict JSON cannot hold."""
+    x = float(x)
+    return round(x, 6) if np.isfinite(x) else None
+
+
+def _set_signals(run: Dict[str, Any], sig: Dict[str, Any]) -> None:
+    if sig:
+        run["signals"] = dict(sig)
+    else:
+        run.pop("signals", None)
 
 
 def _input_key(x) -> Tuple[float, ...]:

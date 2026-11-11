@@ -15,6 +15,13 @@ reproducible and affordable at scale:
   record. A run that silently degraded to the control arm would be worse than a crash.
 * **log every call.** Prompt hash, usage, latency, the parsed design and the raw text go to
   ``llm_calls.jsonl``, which is what the screen's reports are built from.
+
+A **workspace** (``workspace=``) is the harness's hook for anything an agent keeps between calls
+-- notes, code, files a neighbour shared. The policy knows nothing about files; it asks the hook,
+per call, for a text block for the prompt (``context``) and a schema for a ``workspace`` field of
+the design (``schema``), and hands back what the model wrote there (``apply``). The block is part
+of the prompt, so it is part of the cache key: a replay sees the same prompt, reads the same
+answer, and calls ``apply`` with it again -- which is why ``apply`` must be idempotent.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from appfl.decentralized.algorithm.adko_h.campaign import random_design
+from appfl.decentralized.algorithm.adko_h.campaign import RULES, random_design
 from appfl.decentralized.algorithm.adko_h.llm import prompts, schema
 from appfl.decentralized.algorithm.adko_v2.llm.client import Cache, request_key
 
@@ -57,6 +64,15 @@ class CampaignPolicy:
             see ``prompts.py``). The version also sets which test metrics the schema allows.
         note: ask for the sentence the detailed channel carries to the neighbours. Set from
             ``AgentConfig.share_detail``, so the schema and the token agree.
+        workspace: ``None``, or an object with ``context(agent, rnd) -> str`` (appended to the
+            user prompt), ``schema(agent) -> Optional[dict]`` (the JSON schema of a
+            ``workspace`` property added to the design) and ``apply(agent, rnd, value) -> dict``
+            (called after parsing with what the model wrote, or ``None``; its log goes into
+            ``llm_calls.jsonl`` and onto the design as ``workspace_log``).
+
+    ``prompt="v3"`` asks for a design in parts (``schema.campaign_format_v3``), built per call
+    from the agent's context: its rules, how many parts, anchors, class-claim options. The
+    agents' ``AgentConfig.prompt`` must be ``"v3"`` too, or their contexts lack what it reads.
     """
 
     def __init__(
@@ -74,9 +90,10 @@ class CampaignPolicy:
         max_error_rate: float = 0.2,
         prompt: str = "v1",
         note: bool = False,
+        workspace: Optional[Any] = None,
     ):
-        if prompt not in ("v1", "v2"):
-            raise ValueError(f"prompt must be 'v1' or 'v2', got {prompt!r}")
+        if prompt not in ("v1", "v2", "v3"):
+            raise ValueError(f"prompt must be 'v1', 'v2' or 'v3', got {prompt!r}")
         self.client = client
         self.space = space
         self.model = str(model)
@@ -86,7 +103,11 @@ class CampaignPolicy:
         self.max_tokens = int(max_tokens)
         self.budget_range = tuple(budget_range) if budget_range else None
         self.prompt = prompt
-        self.format = schema.campaign_format(
+        self.note = bool(note)
+        self.workspace = workspace
+        # Version 3's format depends on the agent (its rules, parts, claim options), so it is
+        # built per call; the earlier versions' is one object for the run, as it always was.
+        self.format = None if prompt == "v3" else schema.campaign_format(
             space,
             metrics=schema.METRICS_V2 if prompt == "v2" else schema.METRICS,
             budget_range=self.budget_range,
@@ -177,10 +198,33 @@ class CampaignPolicy:
         if hit is None:  # a replayed call costs nothing
             self.totals["cost_usd"] += float(usage.get("cost_usd", 0) or 0)
         self.totals["seconds"] += secs
-        design = schema.parse(self.space, _json(resp.get("text", "")))
+        data = _json(resp.get("text", ""))
+        design = self._parse_v3(data, ctx) if self.prompt == "v3" else schema.parse(self.space, data)
         if design is None:
             self.totals["unusable"] += 1
             design = self._fallback("unusable")
+        elif self.workspace is not None and self.prompt != "v3":
+            design["workspace"] = data.get("workspace")
+        log = None
+        if self.workspace is not None:
+            log = self.workspace.apply(ctx.get("agent"), ctx.get("round"), design.get("workspace"))
+            design["workspace_log"] = log
+        logged = {
+            "region": design["region"].label(self.space),
+            "rule": design["rule"],
+            "budget": design["budget"],
+            "test": design["test"].label(),
+            "p_success": design["p_success"],
+            "hypothesis": design["hypothesis"],
+            "rationale": design["rationale"],
+            "source": design["source"],
+        }
+        if self.prompt == "v3":
+            logged["parts"] = [
+                {"region": q["region"].label(self.space), "rule": q["rule"], "n": q["n"], "anchor": q["anchor"]}
+                for q in design.get("parts") or []
+            ]
+            logged["claim"] = design.get("claim")
         self._write(
             {
                 "agent": ctx.get("agent"),
@@ -190,28 +234,36 @@ class CampaignPolicy:
                 "seconds": round(secs, 3),
                 "usage": usage,
                 "status": resp.get("status"),
-                "design": {
-                    "region": design["region"].label(self.space),
-                    "rule": design["rule"],
-                    "budget": design["budget"],
-                    "test": design["test"].label(),
-                    "p_success": design["p_success"],
-                    "hypothesis": design["hypothesis"],
-                    "rationale": design["rationale"],
-                    "source": design["source"],
-                },
+                "design": logged,
                 "text": (resp.get("text") or "")[:2000],
                 "reasoning": (resp.get("reasoning") or "")[:2000],
+                **({"workspace": log} if self.workspace is not None else {}),
             }
         )
         return design
+
+    def _parse_v3(self, data: Optional[Dict[str, Any]], ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """A version-3 answer, validated against what this agent was offered."""
+        return schema.parse_v3(
+            self.space,
+            data,
+            budget_range=self._budget(ctx),
+            rules=tuple(ctx.get("rules") or RULES),
+            max_parts=int(ctx.get("max_parts", 1)),
+            claim_classes=tuple(ctx.get("claim_classes") or ()) if ctx.get("class_claims") else None,
+        )
+
+    def _budget(self, ctx: Dict[str, Any]):
+        return self.budget_range or tuple(ctx.get("budget_range") or (2, 10))
 
     def record_outcome(self, campaign, verdict: Dict[str, Any]) -> None:
         """A closed campaign's verdict, for the report and for the planner's own record."""
         self.outcomes.append(
             {
                 "claim_id": campaign.claim_id,
-                "region": campaign.region.label(self.space),
+                "region": (
+                    campaign.footprint(self.space) if hasattr(campaign, "footprint") else campaign.region
+                ).label(self.space),
                 "rule": campaign.rule,
                 "budget": campaign.budget,
                 "hypothesis": campaign.hypothesis,
@@ -239,12 +291,27 @@ class CampaignPolicy:
 
     def _request(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
         v2 = self.prompt == "v2"
+        fmt = self.format
+        block, extra_schema = "", None
+        if self.workspace is not None:
+            block = str(self.workspace.context(ctx.get("agent"), ctx.get("round")) or "")
+            extra_schema = self.workspace.schema(ctx.get("agent"))
+        if self.prompt == "v3":
+            instructions = prompts.system_v3(ctx)
+            text = prompts.user_v3({**ctx, "workspace": block} if block else ctx)
+            fmt = self._format_v3(ctx, extra_schema)
+        else:
+            instructions = prompts.system_v2(ctx) if v2 else prompts.SYSTEM
+            text = prompts.user_v2(ctx) if v2 else prompts.user(ctx)
+            if block:
+                text += "\n\n## My workspace\n" + block
+            fmt = schema.with_workspace(fmt, extra_schema)
         req = {
             "model": self.model,
-            "instructions": prompts.system_v2(ctx) if v2 else prompts.SYSTEM,
-            "input": prompts.user_v2(ctx) if v2 else prompts.user(ctx),
+            "instructions": instructions,
+            "input": text,
             "reasoning": {"effort": self.thinking or "low", "summary": "auto"},
-            "text": {"format": self.format},
+            "text": {"format": fmt},
             "store": False,
             "max_output_tokens": self.max_tokens,
         }
@@ -256,6 +323,21 @@ class CampaignPolicy:
             extra["reasoning_effort"] = self.thinking
         req["extra"] = extra
         return req
+
+    def _format_v3(self, ctx: Dict[str, Any], workspace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        classes = tuple(ctx.get("claim_classes") or ()) if ctx.get("class_claims") else None
+        return schema.campaign_format_v3(
+            self.space,
+            metrics=tuple(ctx.get("metrics") or schema.METRICS_V3),
+            budget_range=self._budget(ctx),
+            rules=tuple(ctx.get("rules") or RULES),
+            max_parts=int(ctx.get("max_parts", 1)),
+            classes=classes or None,
+            note=self.note and bool(ctx.get("claims_on", True)),
+            workspace=workspace,
+            anchors=bool(ctx.get("anchors")),
+            text_limits=ctx.get("text_limits"),
+        )
 
     def _fallback(self, why: str) -> Dict[str, Any]:
         d = random_design(self.space, self.rng, budget_range=self.budget_range or (2, 10))
@@ -309,22 +391,84 @@ class MockClient:
         self.calls += 1
         ctx = ctx or {}
         rng = np.random.default_rng([self.seed, int(ctx.get("agent", 0)), int(ctx.get("round", 0))])
+        fmt = ((request or {}).get("text") or {}).get("format") or {}
+        props = (fmt.get("schema") or {}).get("properties") or {}
+        if fmt.get("name") == "campaign_v3":
+            body = self._v3(rng, props, ctx)
+        else:
+            body = self._v2(rng)
+            if "workspace" in props:
+                body["workspace"] = mock_instance(props["workspace"])
+        return {
+            "text": json.dumps(body),
+            "summary": None,
+            "reasoning": "",
+            "usage": {"input_tokens": 1400, "output_tokens": 220, "reasoning_tokens": 0},
+            "response_id": f"mock-{self.calls}",
+            "status": "stop",
+        }
+
+    def _region(self, rng):
+        """A random box, and the JSON a model would write for it."""
         region = self.space.box_around(rng.random(len(self.space)), float(rng.uniform(0.1, 0.35)))
-        body = {
-            "region": {
-                **{
-                    d.name: (
-                        [float(v) for v in region.bounds[d.name]] if d.name in region.bounds else None
-                    )
-                    for d in self.space.dims
-                    if d.kind == "real"
-                },
-                **{
-                    d.name: ([int(i) for i in region.picks[d.name]] if d.name in region.picks else None)
-                    for d in self.space.dims
-                    if d.kind == "cat"
-                },
+        return region, {
+            **{
+                d.name: (
+                    [float(v) for v in region.bounds[d.name]] if d.name in region.bounds else None
+                )
+                for d in self.space.dims
+                if d.kind == "real"
             },
+            **{
+                d.name: ([int(i) for i in region.picks[d.name]] if d.name in region.picks else None)
+                for d in self.space.dims
+                if d.kind == "cat"
+            },
+        }
+
+    def _v3(self, rng, props: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """A version-3 answer from the schema it was given: every enum honoured, every
+        optional field present exactly when the schema has it."""
+        item = props["parts"]["items"]["properties"]
+        rules = list(item["rule"]["enum"])
+        hi = int(item["n"].get("maximum", 6))
+        k = int(rng.integers(1, int(props["parts"].get("maxItems", 1)) + 1))
+        ids = [s["id"] for s in ctx.get("surprises") or []]
+        parts = []
+        for j in range(k):
+            p = {"region": self._region(rng)[1], "rule": str(rng.choice(rules)),
+                 "n": int(rng.integers(1, max(hi // k, 1) + 1))}
+            if "anchor" in item:
+                p["anchor"] = ids[-1] if (j == 0 and ids) else None
+            parts.append(p)
+        metrics = list(props["test"]["properties"]["metric"]["enum"])
+        metric = str(rng.choice(metrics))
+        threshold = (
+            round(float(rng.uniform(0.2, 0.6)), 2) if metric == "mismatch_rate"
+            else round(float(rng.uniform(0.5, 2.0)), 2) if metric in ("max_novelty", "novel_distance")
+            else float(rng.integers(1, 3))
+        )
+        body: Dict[str, Any] = {
+            "parts": parts,
+            "hypothesis": "mock: a mismatch near the first part",
+            "rationale": "mock client; no reasoning performed",
+            "test": {"metric": metric, "op": ">=", "threshold": threshold},
+            "p_success": float(round(rng.uniform(0.3, 0.8), 2)),
+        }
+        if "claim" in props:
+            enum = list(props["claim"]["properties"]["class"]["enum"])
+            body["claim"] = {"part": 0, "class": str(rng.choice(enum))}
+        if "note" in props:
+            body["note"] = "mock: nothing learned"
+        if "workspace" in props:
+            body["workspace"] = mock_instance(props["workspace"])
+        return body
+
+    def _v2(self, rng) -> Dict[str, Any]:
+        """The version-1/2 answer, drawn exactly as it always was (the region first)."""
+        region, box = self._region(rng)
+        return {
+            "region": box,
             "rule": str(rng.choice(["adko", "novelty", "explore", "indep", "exploit"])),
             "budget": int(rng.integers(3, 8)),
             "hypothesis": f"mock: unexplored corner near {region.label(self.space)}",
@@ -336,17 +480,41 @@ class MockClient:
             },
             "p_success": float(round(rng.uniform(0.3, 0.8), 2)),
         }
-        return {
-            "text": json.dumps(body),
-            "summary": None,
-            "reasoning": "",
-            "usage": {"input_tokens": 1400, "output_tokens": 220, "reasoning_tokens": 0},
-            "response_id": f"mock-{self.calls}",
-            "status": "stop",
-        }
 
     async def close(self) -> None:
         return None
+
+
+def mock_instance(s: Dict[str, Any]) -> Any:
+    """The smallest value a JSON schema accepts, deterministically: what the mock writes into a
+    ``workspace`` field it knows nothing about. Required properties only, minimum array lengths,
+    the first enum value."""
+    if not isinstance(s, dict):
+        return None
+    if "const" in s:
+        return s["const"]
+    if s.get("enum"):
+        return s["enum"][0]
+    for key in ("anyOf", "oneOf"):
+        if s.get(key):
+            return mock_instance(s[key][0])
+    t = s.get("type")
+    if isinstance(t, list):
+        t = next((x for x in t if x != "null"), "null")
+    if t == "object":
+        props = s.get("properties") or {}
+        return {k: mock_instance(props.get(k, {})) for k in s.get("required", [])}
+    if t == "array":
+        return [mock_instance(s.get("items") or {}) for _ in range(int(s.get("minItems", 0)))]
+    if t == "string":
+        return "mock"
+    if t == "integer":
+        return int(s.get("minimum", 0))
+    if t == "number":
+        return float(s.get("minimum", 0.0))
+    if t == "boolean":
+        return False
+    return None
 
 
 def build_planner(

@@ -17,10 +17,10 @@ Entry points::
 """
 
 from appfl.decentralized.algorithm.adko_h.agent import ADKOHAgent, AgentConfig
-from appfl.decentralized.algorithm.adko_h.campaign import Campaign, Evidence, Test, random_design
+from appfl.decentralized.algorithm.adko_h.campaign import Campaign, Evidence, Part, Test, Ticket, random_design
 from appfl.decentralized.algorithm.adko_h.claims import Claim, ClaimStore, Verdict
 from appfl.decentralized.algorithm.adko_h.loop import RandomPlanner, RunConfig, run
-from appfl.decentralized.algorithm.adko_h.problem import Candidates, Outcome, Pick, Problem
+from appfl.decentralized.algorithm.adko_h.problem import Candidates, Outcome, Pick, Problem, RuleView
 from appfl.decentralized.algorithm.adko_h.region import Dim, Region, RegionSpace
 from appfl.decentralized.algorithm.adko_h.surrogate import GP
 from appfl.decentralized.algorithm.adko_h.token import HToken
@@ -37,13 +37,16 @@ __all__ = [
     "GP",
     "HToken",
     "Outcome",
+    "Part",
     "Pick",
     "Problem",
     "RandomPlanner",
     "Region",
     "RegionSpace",
+    "RuleView",
     "RunConfig",
     "Test",
+    "Ticket",
     "Verdict",
     "random_design",
     "run",

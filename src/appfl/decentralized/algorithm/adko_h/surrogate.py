@@ -69,6 +69,16 @@ class GP(Surrogate):
         self._y.append(float(observation))
         self._dirty = True
 
+    def refit(self, X: Sequence[Sequence[float]], y: Sequence[float]) -> None:
+        """Replace the data with ``(X, y)``: a late label changed a past observation.
+
+        The agent passes its whole history, in the order it was added, so the fit is exactly
+        the one the corrected outcomes would have produced.
+        """
+        self._X = [np.asarray(x, dtype=float).ravel() for x in X]
+        self._y = [float(v) for v in y]
+        self._dirty = True
+
     def _fit(self) -> None:
         X = np.asarray(self._X[-self.max_points :], dtype=float)
         y = np.asarray(self._y[-self.max_points :], dtype=float)
