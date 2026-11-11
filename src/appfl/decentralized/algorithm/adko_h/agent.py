@@ -211,6 +211,16 @@ class AgentConfig:
     prompt: str = "v2"
     share_signals: bool = False
     events: bool = False
+    # Text limits, in characters, of what the planner writes: what a campaign stores, and what the
+    # detailed channel carries on the wire (claims and verdicts carry up to ``hypothesis_chars`` of
+    # the hypothesis, never less than ``DETAIL_CHARS``; the insight line up to ``insight_chars``).
+    # The defaults are the limits every earlier arm ran with, unchanged. In snap500 the note was cut
+    # in 48 of 49 designs (median 61 % kept) because no prompt stated the limit; the v3 prompt states
+    # these, so a model writes to fit instead of being cut, and an arm can raise them.
+    note_chars: int = NOTE_CHARS
+    hypothesis_chars: int = 300
+    rationale_chars: int = 600
+    insight_chars: int = 400
 
 
 def _agency(cfg: AgentConfig) -> bool:
@@ -451,6 +461,8 @@ class ADKOHAgent:
             "claim_classes": list(hsignals.claim_classes(classes)) if self.cfg.class_claims else [],
             "followup": self.cfg.followup,
             "replan_on_surprise": self.cfg.replan_on_surprise,
+            "text_limits": {"hypothesis": self.cfg.hypothesis_chars, "rationale": self.cfg.rationale_chars,
+                            "note": self.cfg.note_chars},
             "surprises": [self._surprise_row(s) for s in self.surprises[-12:]],
             "n_surprises": len(self.surprises),
             "tickets": [t.to_dict(self.space) for t in self.tickets[-8:]],
@@ -610,9 +622,9 @@ class ADKOHAgent:
                 region=region,
                 rule=hrules.valid_rule(self.cfg.force_rule or design.get("rule", "adko"), self.cfg.extra_rules),
                 budget=int(design.get("budget", self.cfg.default_budget)),
-                hypothesis=str(design.get("hypothesis", ""))[:300],
-                rationale=str(design.get("rationale", ""))[:600],
-                note=str(design.get("note", ""))[:NOTE_CHARS],
+                hypothesis=str(design.get("hypothesis", ""))[: self.cfg.hypothesis_chars],
+                rationale=str(design.get("rationale", ""))[: self.cfg.rationale_chars],
+                note=str(design.get("note", ""))[: self.cfg.note_chars],
                 test=design.get("test") or Test(),
                 p_success=float(design.get("p_success", 0.5)),
                 claim_id=f"a{self.index}c{len(self.campaigns)}",
@@ -674,9 +686,9 @@ class ADKOHAgent:
             region=parts[0].region,
             rule=parts[0].rule,
             parts=parts,
-            hypothesis=str(design.get("hypothesis", ""))[:300],
-            rationale=str(design.get("rationale", ""))[:600],
-            note=str(design.get("note", ""))[:NOTE_CHARS],
+            hypothesis=str(design.get("hypothesis", ""))[: self.cfg.hypothesis_chars],
+            rationale=str(design.get("rationale", ""))[: self.cfg.rationale_chars],
+            note=str(design.get("note", ""))[: self.cfg.note_chars],
             test=design.get("test") or Test(),
             p_success=float(design.get("p_success", 0.5)),
             claim_id=cid,
@@ -748,13 +760,13 @@ class ADKOHAgent:
     def _verdict_chars(self) -> int:
         """How much of the hypothesis a verdict carries, by channel width."""
         if self.cfg.share_detail:
-            return DETAIL_CHARS
+            return max(DETAIL_CHARS, int(self.cfg.hypothesis_chars))
         return VERDICT_CHARS if self.cfg.share_text else 80
 
     def _claim_text(self, c: Campaign) -> str:
         """The hypothesis a claim carries: nothing, a truncation, or all of it."""
         if self.cfg.share_detail:
-            return c.hypothesis[:DETAIL_CHARS]
+            return c.hypothesis[: max(DETAIL_CHARS, int(self.cfg.hypothesis_chars))]
         return c.hypothesis[:CLAIM_CHARS] if self.cfg.share_text else ""
 
     def _hit_box(self, c: Campaign):
@@ -1491,7 +1503,7 @@ class ADKOHAgent:
         return (
             f"{c.hypothesis or '(no hypothesis)'} | why: {c.rationale or '(none)'} | "
             f"{'held' if v['success'] else 'failed'} ({v['metric']}={val} vs {v['op']} {v['threshold']:g})"
-        )[:400]
+        )[: self.cfg.insight_chars]
 
     # -- bookkeeping -----------------------------------------------------------------------
 

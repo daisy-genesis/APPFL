@@ -336,6 +336,7 @@ class CampaignPolicy:
             note=self.note and bool(ctx.get("claims_on", True)),
             workspace=workspace,
             anchors=bool(ctx.get("anchors")),
+            text_limits=ctx.get("text_limits"),
         )
 
     def _fallback(self, why: str) -> Dict[str, Any]:

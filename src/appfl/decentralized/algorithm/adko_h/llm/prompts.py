@@ -317,7 +317,8 @@ regions you pick. For the next campaign you choose:
    - region: an interval per coordinate, or null to leave that coordinate free
    - rule: how to choose inside the region (see the list in the message)
    - n: how many experiments the part gets
-2. hypothesis -- one sentence saying what you expect to find, stated now
+2. hypothesis -- what you expect to find, stated now, in at most {hypothesis} characters; and a \
+rationale -- why these regions and rules, in at most {rationale} characters
 3. test -- a metric, >= or <=, and a threshold, computed from the campaign's data when its \
 experiments are spent
 4. p_success -- your probability that the test passes
@@ -373,9 +374,29 @@ _RULE_TEXT_V3 = {
 }
 
 
+#: The limits a v3 prompt states when the context carries none: those every earlier arm ran with.
+_TEXT_LIMITS_V3 = {"hypothesis": 300, "rationale": 600, "note": 240}
+
+_NOTE_V3 = """
+
+Your neighbours cannot see your results. The only account of them they get is the note you \
+write, which travels with your claim and your verdict. Also answer with:
+
+note -- to your neighbours, in at most {note} characters: what your last campaign taught you \
+about where the surprises are. Write what you would want from them: which coordinates mattered, \
+what did not work, and how sure you are. It is not read by any rule, only by other planners.
+
+Text past a limit is cut, so write to fit."""
+
+
+def _limits_v3(ctx: Dict[str, Any]) -> Dict[str, int]:
+    return {**_TEXT_LIMITS_V3, **{k: int(v) for k, v in (ctx.get("text_limits") or {}).items()}}
+
+
 def system_v3(ctx: Dict[str, Any]) -> str:
     """The version-3 system prompt; each paragraph only when the arm has what it describes."""
-    out = _SYSTEM_V3 + (_CLAIMS_V2 if ctx.get("claims_on", True) else "")
+    limits = _limits_v3(ctx)
+    out = _SYSTEM_V3.format(**limits) + (_CLAIMS_V2 if ctx.get("claims_on", True) else "")
     if ctx.get("anchors"):
         out += _ANCHORS_V3
     if ctx.get("replan_on_surprise"):
@@ -383,7 +404,7 @@ def system_v3(ctx: Dict[str, Any]) -> str:
     if ctx.get("class_claims"):
         out += _CLAIM_V3
     if ctx.get("claims_on", True) and ctx.get("share_detail"):
-        out += _NOTE_V2
+        out += _NOTE_V3.format(**limits)
     return out
 
 

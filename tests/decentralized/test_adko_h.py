@@ -2009,6 +2009,33 @@ class TestPromptV3(unittest.TestCase):
         self.assertNotIn("anchor", prompts.system_v3(plain.plan_context(0)))
         self.assertIn("Use one part", prompts.user_v3(plain.plan_context(0)))
 
+    def test_text_limits_are_stated_stored_and_carried(self):
+        from appfl.decentralized.algorithm.adko_h.llm import prompts
+
+        long = {"hypothesis": "h" * 700, "rationale": "r" * 1000, "note": "n" * 600}
+        # The defaults: the limits every earlier arm ran with, stated in the v3 prompt.
+        a = self.agent(share_detail=True)
+        c = a.set_campaign({**design(a.space, budget=3), **long}, 0)
+        self.assertEqual((len(c.hypothesis), len(c.rationale), len(c.note)), (300, 600, 240))
+        system = prompts.system_v3(a.plan_context(1))
+        self.assertIn("at most 300 characters", system)
+        self.assertIn("in at most 240 characters", system)
+        self.assertNotIn("one sentence", system)
+        # Raised limits: stored, stated in the prompt and the schema, and carried whole on the wire.
+        b = self.agent(share_detail=True, note_chars=500, hypothesis_chars=600, rationale_chars=900,
+                       insight_chars=1700)
+        c = b.set_campaign({**design(b.space, budget=3), **long}, 0)
+        self.assertEqual((len(c.hypothesis), len(c.rationale), len(c.note)), (600, 900, 500))
+        self.assertEqual(len(b._claim_text(c)), 600)
+        self.assertEqual(b._verdict_chars(), 600)
+        ctx = b.plan_context(1)
+        system = prompts.system_v3(ctx)
+        for text in ("in at most 600 characters", "in at most 900 characters", "in at most 500 characters"):
+            self.assertIn(text, system)
+        fmt = hschema.campaign_format_v3(b.space, note=True, text_limits=ctx["text_limits"])["schema"]
+        self.assertIn("at most 600 characters", fmt["properties"]["hypothesis"]["description"])
+        self.assertIn("at most 500 characters", fmt["properties"]["note"]["description"])
+
     def test_the_schema_has_exactly_what_the_arm_uses(self):
         sp = SignalSynthetic().region_space
         fmt = hschema.campaign_format_v3(sp, budget_range=(2, 6), rules=hrules.RULES + ("lowx1",),

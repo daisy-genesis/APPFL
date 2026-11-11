@@ -152,6 +152,7 @@ def campaign_format_v3(
     note: bool = False,
     workspace: Optional[Dict[str, Any]] = None,
     anchors: bool = False,
+    text_limits: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """The version-3 response format: a design in 1 to ``max_parts`` parts.
 
@@ -160,8 +161,13 @@ def campaign_format_v3(
     name) adds a nullable ``claim``; ``note`` the detailed channel's sentence; ``workspace`` the
     harness's object. The total of the counts is not expressible in JSON schema, so the parser
     clamps it to ``budget_range``; each count is bounded here by the largest total.
+
+    ``text_limits`` ({hypothesis, rationale, note}: characters) go into the field descriptions, as the
+    prompt states them; they are not ``maxLength`` keywords, which guided-decoding backends do not all
+    support, and the agent cuts what runs past them.
     """
     lo, hi = tuple(budget_range) if budget_range else BUDGET_RANGE
+    lim = {"hypothesis": 300, "rationale": 600, "note": 240, **{k: int(v) for k, v in (text_limits or {}).items()}}
     max_parts = max(int(max_parts), 1)
     part_props: Dict[str, Any] = {
         "region": _region_schema(space),
@@ -190,8 +196,9 @@ def campaign_format_v3(
                 "properties": part_props,
             },
         },
-        "hypothesis": {"type": "string", "description": "one sentence, stated before the data exists"},
-        "rationale": {"type": "string", "description": "why these regions and rules"},
+        "hypothesis": {"type": "string",
+                       "description": f"what you expect to find, stated before the data exists; at most {lim['hypothesis']} characters"},
+        "rationale": {"type": "string", "description": f"why these regions and rules; at most {lim['rationale']} characters"},
         "test": _test_schema(metrics),
         "p_success": {
             "type": "number",
@@ -212,7 +219,9 @@ def campaign_format_v3(
             "description": "the class you claim forms in one part (0-based), or null",
         }
     if note:
-        props["note"] = dict(_NOTE_SCHEMA)
+        props["note"] = {"type": "string", "description": (
+            f"to your neighbours, at most {lim['note']} characters: what your last campaign taught you about "
+            "where the surprises are, in your own words")}
     schema = {
         "type": "object",
         "additionalProperties": False,
