@@ -167,6 +167,10 @@ def pick(v: np.ndarray, mask: Optional[np.ndarray] = None) -> int:
     return int(np.argmax(v))
 
 
-def valid_rule(name: str) -> str:
-    """``name`` if it is a rule, else ``"adko"`` -- the planner's output lands here too."""
-    return str(name) if str(name) in RULES else "adko"
+def valid_rule(name: str, extra: Sequence[str] = (), default: str = "adko") -> str:
+    """``name`` if it is a rule, else ``default`` -- the planner's output lands here too.
+
+    ``extra`` are rule names a problem supplies (``AgentConfig.extra_rules``); a multi-part
+    design falls back to ``explore`` rather than ``adko``, as its parser does.
+    """
+    return str(name) if str(name) in RULES or str(name) in tuple(extra) else default

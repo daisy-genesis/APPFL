@@ -234,6 +234,48 @@ class RegionSpace:
     def full(self) -> Region:
         return Region()
 
+    def widen(self, region: Region, point: Sequence[float]) -> Region:
+        """``region`` stretched, coordinate by coordinate, just enough to contain ``point``.
+
+        How an anchor works: a planner that names a surprise gets a region that includes it,
+        however it drew the box, and nothing else about its design changes. A coordinate the
+        region leaves free already contains everything.
+        """
+        p = np.asarray(point, dtype=float).ravel()
+        bounds = dict(region.bounds)
+        picks = dict(region.picks)
+        for i, d in enumerate(self.dims):
+            if i >= len(p):
+                break
+            v = float(p[i])
+            if d.kind == KIND_CAT and d.name in picks:
+                picks[d.name] = tuple(sorted(set(picks[d.name]) | {int(round(v))}))
+            elif d.kind == KIND_REAL and d.name in bounds:
+                lo, hi = bounds[d.name]
+                bounds[d.name] = (min(lo, v), max(hi, v))
+        return self.region(bounds=bounds, picks=picks)
+
+    def hull(self, regions: Sequence[Region]) -> Region:
+        """The smallest region containing all of ``regions``: what a multi-part campaign covered.
+
+        A coordinate any of them leaves free stays free; one region is returned as it is.
+        """
+        regions = list(regions)
+        if len(regions) == 1:
+            return regions[0]
+        bounds: Dict[str, Sequence[float]] = {}
+        picks: Dict[str, Sequence[int]] = {}
+        for d in self.dims:
+            if d.kind == KIND_CAT:
+                if regions and all(d.name in r.picks for r in regions):
+                    picks[d.name] = sorted(set().union(*(set(r.picks[d.name]) for r in regions)))
+            elif regions and all(d.name in r.bounds for r in regions):
+                bounds[d.name] = (
+                    min(r.bounds[d.name][0] for r in regions),
+                    max(r.bounds[d.name][1] for r in regions),
+                )
+        return self.region(bounds=bounds, picks=picks)
+
     def unpack(self, data: Optional[Sequence[Any]]) -> Region:
         """Rebuild a region from :meth:`Region.pack`, validated like any other input."""
         bounds: Dict[str, Sequence[float]] = {}

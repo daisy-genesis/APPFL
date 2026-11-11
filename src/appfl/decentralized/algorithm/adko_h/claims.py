@@ -25,6 +25,11 @@ is worth its bits: the full hypothesis rather than a truncation, the planner's o
 about what its last campaign taught it, and the box this campaign's hits fell in. The last of
 those is still region language, so the invariant above holds -- a box over the planner's own
 coordinates, not the molecule that was run.
+
+Two more verdicts carry a *status* set by code rather than a test: a **class claim** (``in part
+j, class C forms``: supported, refuted or unsettled) and a **ticket** (the code's follow-up of a
+surprise: reproduced, not_reproduced or unsettled). Both reuse the verdict's region and number
+and add the class or kind they are about; a verdict without them weighs what it always did.
 """
 
 from __future__ import annotations
@@ -69,16 +74,20 @@ class Claim:
     ttl: int = CLAIM_TTL
     #: The planner's sentence to its neighbours, sent only on the detailed channel.
     note: str = ""
+    #: The class (or kind, or ``mismatch``) a class claim says forms in this region.
+    predicts: str = ""
 
     @property
     def key(self) -> Tuple[int, str]:
         return (int(self.origin), str(self.claim_id))
 
     def to_dict(self) -> Dict[str, Any]:
-        """The wire form. An empty note is left out, so a non-detailed claim weighs what it did."""
+        """The wire form. An empty note or class is left out, so a plain claim weighs what it did."""
         d = asdict(self)
         if not d["note"]:
             d.pop("note")
+        if not d["predicts"]:
+            d.pop("predicts")
         return d
 
 
@@ -109,6 +118,10 @@ class Verdict:
     #: region language, the same vocabulary a claim already travels in, not a design point.
     note: str = ""
     hit_box: Any = None
+    #: A status set by code (``metric`` ``class_claim`` or ``ticket``), and the class or kind
+    #: it is about. Empty on a test verdict.
+    predicts: str = ""
+    status: str = ""
 
     @property
     def key(self) -> Tuple[int, str]:
@@ -121,6 +134,13 @@ class Verdict:
         ``space`` is given) and what it found there.
         """
         v = "n/a" if self.value is None else f"{self.value:g}"
+        if self.status:
+            where = f" in {region_of(space, self.region).label(space)}" if space is not None else ""
+            if self.metric == "ticket":
+                what = f"follow-up of a {self.predicts or '?'} surprise{where}: {v} draws reproduced it"
+            else:
+                what = f'class claim "{self.predicts or "?"}"{where}: share showing it {v}'
+            return f"[a{self.origin}] {self.status.upper()}: {what}" + self._detail(space)
         test = (
             f"[a{self.origin}] {'HELD' if self.success else 'FAILED'}: {self.hypothesis or '(none)'} "
             f"({self.metric} {v} vs {self.op} {self.threshold:g})"
@@ -153,6 +173,9 @@ class Verdict:
             d.pop("note")
         if d["hit_box"] is None:
             d.pop("hit_box")
+        for k in ("predicts", "status"):
+            if not d[k]:
+                d.pop(k)
         return d
 
 
@@ -280,6 +303,7 @@ class ClaimStore:
         rows = [
             f"[a{c.origin}] {region_of(self.space, c.region).label(self.space)} "
             f"rule={c.rule} until round {c.expires}: {c.hypothesis or '(none)'}"
+            + (f'; claims "{c.predicts}" forms there' if c.predicts else "")
             + (f'; a{c.origin} notes: "{c.note}"' if c.note else "")
             for c in self.active(now)
         ]

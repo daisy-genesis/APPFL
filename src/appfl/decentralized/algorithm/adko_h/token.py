@@ -14,6 +14,11 @@ is chasing the same scalar. A diversity problem needs two more things, and both 
 Both additions are structured and already quantized, so a randomized-response channel can be
 put in front of them later without touching this file. Sharing either is optional, because
 "does sharing the footprint explain the gain?" is one of the ablations the screen runs.
+
+With ``AgentConfig.share_signals`` a token also carries a few signal bits about its result
+(kind, mismatch, surprise; a surprise adds where it sat in region coordinates, so a neighbour can
+anchor on it) and the revisions of earlier results whose labels settled since the last token.
+Both are left off the wire when empty, so a token without them is byte for byte what it was.
 """
 
 from __future__ import annotations
@@ -59,6 +64,11 @@ class HToken(KnowledgeToken):
     ``relayed`` carries other agents' reported inputs one hop further, each as
     ``{"h": hops travelled so far, "x": the input as its owner's token reported it}``. Only the
     peer-input filter reads them; it is empty unless the arm sets ``input_hops`` above one.
+
+    ``signals`` is this result's signal bits (``kind``, ``mismatch``, ``surprise``, and ``at``,
+    its region coordinates, when it is a surprise); ``revised`` lists earlier results of the
+    sender whose labels settled since its last token, each ``{"r": round run, "family", ...the
+    same bits}``. Both are empty unless the sender shares signals.
     """
 
     descriptor: List[float] = field(default_factory=list)
@@ -66,11 +76,16 @@ class HToken(KnowledgeToken):
     claims: List[Claim] = field(default_factory=list)
     verdicts: List[Verdict] = field(default_factory=list)
     relayed: List[Dict[str, Any]] = field(default_factory=list)
+    signals: Dict[str, Any] = field(default_factory=dict)
+    revised: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["claims"] = [c if isinstance(c, dict) else c.to_dict() for c in self.claims]
         d["verdicts"] = [v if isinstance(v, dict) else v.to_dict() for v in self.verdicts]
+        for k in ("signals", "revised"):
+            if not d[k]:
+                d.pop(k)
         return d
 
     @classmethod
@@ -87,6 +102,8 @@ class HToken(KnowledgeToken):
             claims=[Claim(**c) for c in d.get("claims", [])],
             verdicts=[Verdict(**v) for v in d.get("verdicts", [])],
             relayed=[{"h": int(r["h"]), "x": list(r["x"])} for r in d.get("relayed", [])],
+            signals=dict(d.get("signals", {})),
+            revised=[dict(r) for r in d.get("revised", [])],
         )
 
     def payload_bits(self) -> int:
@@ -94,7 +111,8 @@ class HToken(KnowledgeToken):
 
         ``len(x)`` inputs and each descriptor component at 8 bits, 8 for ``q``, 1 for the flag,
         the text and campaign messages at one byte per character, and each relayed input at
-        8 bits a coordinate plus 8 for its hop count. What ``size_bits`` reports stays the JSON
+        8 bits a coordinate plus 8 for its hop count. Signal bits and revisions count as the
+        campaign messages do, by their compact JSON. What ``size_bits`` reports stays the JSON
         length, so budgets remain comparable with v1 and v2.
         """
         bits = 8 * (len(self.x) + len(self.descriptor)) + 8 + 1
@@ -102,6 +120,8 @@ class HToken(KnowledgeToken):
         bits += 8 * len(self.insight or "") + 8 * len(self.family)
         for m in list(self.claims) + list(self.verdicts):
             bits += 8 * len(json.dumps(m if isinstance(m, dict) else m.to_dict(), separators=(",", ":")))
+        for m in ([self.signals] if self.signals else []) + list(self.revised):
+            bits += 8 * len(json.dumps(m, separators=(",", ":"), default=str))
         return bits
 
 
@@ -121,6 +141,8 @@ def encode(
     claims: Sequence[Claim] = (),
     verdicts: Sequence[Verdict] = (),
     relayed: Sequence[Dict[str, Any]] = (),
+    signals: Optional[Dict[str, Any]] = None,
+    revised: Sequence[Dict[str, Any]] = (),
 ) -> HToken:
     """One result and this round's campaign messages in, one token out.
 
@@ -141,4 +163,6 @@ def encode(
         claims=list(claims),
         verdicts=list(verdicts),
         relayed=[{"h": int(r["h"]), "x": list(r["x"])} for r in relayed],
+        signals=dict(signals or {}),
+        revised=[dict(r) for r in revised],
     )
