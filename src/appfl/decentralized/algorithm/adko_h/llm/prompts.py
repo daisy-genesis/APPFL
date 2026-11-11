@@ -293,3 +293,266 @@ Budget must be between {lo} and {hi} experiments.
 Test metrics:
 {_METRICS_V2}
 Answer with the JSON object only."""
+
+
+# -- version 3 ---------------------------------------------------------------------------------
+#
+# Written after the snapshot read-out: the planner had optimized a proxy (hull directions, in-loop
+# family counts) while the states worth finding were mismatches between the observed class and
+# the class predicted for the recipe, and the campaign that found the first one failed its family
+# test and was written off. Version 3 names the target and the agent's role in the problem's own
+# words, reports what each campaign found in those terms (settled, pending, mismatches by kind,
+# surprises), lists every surprise with an id the planner can anchor a part on, shows the code's
+# follow-up of each, and asks for a design in parts. Pending labels are said to be pending: a test
+# never counts them, and the planner should not read them as failures.
+
+_SYSTEM_V3 = """You plan experimental campaigns for one laboratory in a federation of independent \
+laboratories. Each laboratory runs its own experiments and can only exchange small signals \
+with its neighbours; there is no central coordinator and no shared database of results.
+
+You do not choose experiments. A calibrated numeric rule chooses every experiment inside the \
+regions you pick. For the next campaign you choose:
+
+1. parts -- one or more parts, run in order. Each part is
+   - region: an interval per coordinate, or null to leave that coordinate free
+   - rule: how to choose inside the region (see the list in the message)
+   - n: how many experiments the part gets
+2. hypothesis -- one sentence saying what you expect to find, stated now
+3. test -- a metric, >= or <=, and a threshold, computed from the campaign's data when its \
+experiments are spent
+4. p_success -- your probability that the test passes
+
+Results carry labels: the class observed, the class predicted for the recipe, and whether they \
+differ (a mismatch) and how. A surprise is a settled mismatch of a kind worth following up. Some \
+labels are pending when a campaign is judged; pending results count neither for nor against a \
+test.
+
+When an experiment is a surprise, code -- not you -- follows it up: the next few experiments are \
+drawn as close to it as possible, and the follow-up says whether the surprise came back \
+(reproduced, not_reproduced, or unsettled while labels are pending).
+
+Your p_success is scored against what happens. Set the threshold from your base rates so that \
+you expect the test to pass about half the time: a test that is sure to pass, or sure to fail, \
+tells you nothing."""
+
+_ANCHORS_V3 = """
+
+A part may name a surprise as its anchor (its id, s<k>): its region is widened to contain that \
+recipe. Use it to work near a surprise; leave it null otherwise."""
+
+_REPLAN_V3 = """
+
+A surprise ends your current campaign early (judged on what it has so far), and you are asked \
+again once its follow-up draws are spent, so you can plan around it."""
+
+_CLAIM_V3 = """
+
+You may also claim which class forms in one part: claim {part, class} (part counts from 0), or \
+null. Code sets the claim's status when the campaign closes: supported if at least half of that \
+part's settled results show the class, refuted if fewer do, unsettled if none has settled. \
+"mismatch" means any surprise kind. Your neighbours see the claim and its status."""
+
+_METRIC_TEXT_V3 = {
+    "mismatches": "settled results whose observed class differs from the predicted one (an integer)",
+    "mismatch_rate": "mismatches over settled results, 0 to 1 (0 when nothing has settled)",
+    "surprises": "settled results that are surprises (an integer)",
+    "max_novelty": "the largest novelty (distance from the nearest known class) among settled results",
+    "new_families": "families in this campaign that nobody had reported to me when it started (an integer)",
+    "novel_distance": "how far this campaign's most isolated outcome lands from every outcome known at "
+    "its start, in standardized descriptor units",
+    "hull_growth": "how much this campaign grows the convex hull of known outcomes",
+    "max_objective": "the best score this campaign reaches",
+}
+
+_RULE_TEXT_V3 = {
+    "adko": "my model plus my neighbours' signals; goes for high scores near what the team has found",
+    "indep": "my model alone, ignoring neighbours",
+    "exploit": "my model's predicted best; the narrowest search",
+    "explore": "where my model is least certain; broad coverage",
+    "novelty": "furthest from everything anyone is known to have run",
+}
+
+
+def system_v3(ctx: Dict[str, Any]) -> str:
+    """The version-3 system prompt; each paragraph only when the arm has what it describes."""
+    out = _SYSTEM_V3 + (_CLAIMS_V2 if ctx.get("claims_on", True) else "")
+    if ctx.get("anchors"):
+        out += _ANCHORS_V3
+    if ctx.get("replan_on_surprise"):
+        out += _REPLAN_V3
+    if ctx.get("class_claims"):
+        out += _CLAIM_V3
+    if ctx.get("claims_on", True) and ctx.get("share_detail"):
+        out += _NOTE_V2
+    return out
+
+
+def _signal_line(f: Dict[str, Any]) -> str:
+    kinds = ", ".join(f"{k} {n}" for k, n in (f.get("kinds") or {}).items()) or "none"
+    nov = f.get("max_novelty")
+    return (
+        f"{f.get('spent', 0)} experiments ({f.get('settled', 0)} settled, {f.get('pending', 0)} pending), "
+        f"{f.get('mismatches', 0)} mismatches, {f.get('surprises', 0)} surprises, kinds: {kinds}, "
+        f"max novelty {'n/a' if nov is None else nov}"
+    )
+
+
+def _recent_v3(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "(this is your first campaign)"
+    out = []
+    for c in items:
+        v = c.get("verdict") or {}
+        if v:
+            test = (
+                f"test {v.get('metric')} {v.get('op')} {float(v.get('threshold', 0)):g}: "
+                f"{'HELD' if v.get('success') else 'FAILED'} (value {v.get('value')}"
+                + (f", {v['n_pending']} pending" if v.get("n_pending") else "")
+                + ")"
+                + (" -- closed early by a surprise" if v.get("early") else "")
+            )
+        else:
+            test = "still running"
+        parts = c.get("parts") or []
+        where = (
+            "; ".join(
+                f"part {j}: {p.get('region_label')} rule={p.get('rule')} n={p.get('n')}"
+                + (f" anchor={p['anchor']}" if p.get("anchor") else "")
+                for j, p in enumerate(parts)
+            )
+            if parts
+            else f"{c.get('region_label')} rule={c.get('rule')} budget={c.get('budget')}"
+        )
+        claim = c.get("claim")
+        cl = (
+            f'; claim "{claim.get("class")}" in part {claim.get("part")}: '
+            f'{(claim.get("status") or "open").upper()}'
+            if claim
+            else ""
+        )
+        out.append(f"- [{c.get('claim_id')}] {where}: {_signal_line(c.get('signals') or {})}; {test}{cl}")
+    return "\n".join(out)
+
+
+def _surprises_v3(items: List[Dict[str, Any]], n: int) -> str:
+    if not items:
+        return "(none yet)"
+    head = f"(the last {len(items)} of {n})\n" if n > len(items) else ""
+    return head + "\n".join(
+        f"- {s['id']} ({s.get('source')}, round {s.get('round')}): {s.get('recipe')}; "
+        f"kind {s.get('kind') or '?'}; observed {s.get('observed') or '?'}, predicted "
+        f"{s.get('predicted') or '?'}; follow-up: {s.get('status') or 'none'}"
+        for s in items
+    )
+
+
+def _tickets_v3(items: List[Dict[str, Any]], queued: int) -> str:
+    if not items:
+        return "(none)" + (f"; {queued} surprises waiting for one" if queued else "")
+    rows = [
+        f"- {t['id']} for {t.get('surprise')} ({t.get('kind') or '?'}) in {t.get('region_label')}: "
+        f"{t.get('spent')}/{t.get('draws')} draws, {t.get('reproduced')} reproduced, "
+        f"{t.get('pending')} pending; {t.get('status')}"
+        for t in items
+    ]
+    if queued:
+        rows.append(f"({queued} surprises waiting for a follow-up)")
+    return "\n".join(rows)
+
+
+def _rates_v3(r: Optional[Dict[str, Any]]) -> str:
+    if not r:
+        return "(none of my campaigns has finished yet)"
+
+    def f(v, fmt):
+        return "n/a" if v is None else format(v, fmt)
+
+    return (
+        f"over my {r['campaigns']} finished campaigns ({r['experiments']} experiments, "
+        f"{r['settled']} settled, {r['pending']} pending): mismatch rate "
+        f"{f(r.get('mismatch_rate'), '.3f')}, surprise rate {f(r.get('surprise_rate'), '.3f')} per "
+        f"settled experiment, mean max novelty {f(r.get('mean_max_novelty'), '.3g')}"
+    )
+
+
+def user_v3(ctx: Dict[str, Any]) -> str:
+    """The version-3 user message: target and role, signals, surprises, follow-ups, parts."""
+    p = ctx.get("problem", {})
+    first = (
+        f"This is your first campaign. Your assigned starting territory is: {ctx['territory']}. "
+        "Start inside it, and narrow it if you have a reason to."
+        if ctx.get("first_campaign")
+        else "You may work anywhere in the space."
+    )
+    claims = (
+        f"""
+## My neighbours' active claims (regions they are working in now)
+{ctx.get('active_claims', '(none)')}
+
+## Verdicts that reached me (theirs and mine): tests, class claims, follow-ups
+{ctx.get('verdicts', '(nothing yet)')}
+"""
+        if ctx.get("claims_on", True)
+        else ""
+    )
+    lo, hi = ctx.get("budget_range", [2, 10])
+    notes = ctx.get("rule_notes") or {}
+    rules = "\n".join(
+        f"   - {r}: {notes.get(r) or _RULE_TEXT_V3.get(r, '(supplied by the problem)')}"
+        for r in ctx.get("rules", [])
+    )
+    metrics = "\n".join(f"- {m}: {_METRIC_TEXT_V3.get(m, m)}" for m in ctx.get("metrics", []))
+    k = int(ctx.get("max_parts", 1))
+    shape = (
+        f"Use 1 to {k} parts; their experiments together must be between {lo} and {hi}."
+        if k > 1
+        else f"Use one part of between {lo} and {hi} experiments."
+    )
+    claim = (
+        "Class claim options: " + ", ".join(ctx.get("claim_classes") or []) + "."
+        if ctx.get("class_claims")
+        else ""
+    )
+    workspace = f"\n## My workspace\n{ctx['workspace']}\n" if ctx.get("workspace") else ""
+    return f"""## Task
+{p.get('task', '')}
+
+## Target
+{ctx.get('target') or p.get('target') or '(not stated)'}
+
+## My role
+{ctx.get('role') or '(none assigned)'}
+
+## What an outcome is
+{p.get('outcome', '')}
+
+## Design space coordinates
+{ctx.get('dims', '')}
+
+## Domain notes
+{p.get('hints', '')}
+
+## My laboratory (agent {ctx.get('agent')}, round {ctx.get('round')})
+Experiments I have run: {ctx.get('n_evaluated')}
+Distinct families: I have found {ctx.get('n_families', 0)}; my neighbours have reported \
+{ctx.get('n_peer_families', 0)}.
+My base rates: {_rates_v3(ctx.get('signal_rates'))}.
+
+## Surprises (mine and my neighbours'), with ids
+{_surprises_v3(ctx.get('surprises') or [], int(ctx.get('n_surprises', 0)))}
+
+## Follow-ups of my surprises
+{_tickets_v3(ctx.get('tickets') or [], int(ctx.get('queued', 0)))}
+
+## My recent campaigns, oldest first, with what each found
+{_recent_v3(ctx.get('recent_v3') or [])}
+{claims}{workspace}
+## Choose the next campaign
+{first}
+{shape}
+Rules:
+{rules}
+Test metrics (pending results are not counted):
+{metrics}
+{claim}
+Answer with the JSON object only."""
