@@ -114,6 +114,17 @@ class RuleView:
         own_signals, own_families: the same history's signals and families, row-aligned.
         known_inputs: every input this agent knows was run, its own and its peers'.
         seed: deterministic per (run seed, agent, round), for a rule that draws.
+
+    Optional (``None`` when the agent has nothing to give; a rule must cope with that):
+
+        region: the region of the part being run (the mask's region), for a rule that lays
+            something over its box.
+        own_descriptors: the descriptor of each own result, row-aligned with ``own_X``; a NaN
+            row where a result has none (a failed or capped run).
+        known_descriptors: every descriptor the agent knows, its own and its peers' tokens'
+            (what the hull and novelty tests compare against).
+        progress: the share of the run's budget spent, when the driver knows it. The agent
+            does not, so it leaves this ``None`` and a rule falls back on ``round``.
     """
 
     agent: int
@@ -131,6 +142,10 @@ class RuleView:
     own_families: Sequence[str]
     known_inputs: np.ndarray
     seed: int
+    region: Any = None
+    own_descriptors: Optional[np.ndarray] = None
+    known_descriptors: Optional[np.ndarray] = None
+    progress: Optional[float] = None
 
 
 #: A problem-supplied rule: one value per candidate, higher is better; NaN is treated as -inf.

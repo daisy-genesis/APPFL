@@ -998,6 +998,10 @@ class ADKOHAgent:
             own_families=list(self._fams),
             known_inputs=self._known_inputs(),
             seed=int(np.random.SeedSequence([self.seed, self.index, int(rnd), 4049]).generate_state(1)[0]),
+            region=c.region,
+            own_descriptors=_rows([z if z.size else None for z in self._desc],
+                                  int(self.problem.descriptor_dim() or 0)),
+            known_descriptors=self._descriptors(),
         )
         try:
             v = np.asarray(fn(view), dtype=float)

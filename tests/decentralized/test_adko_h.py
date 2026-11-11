@@ -1858,6 +1858,21 @@ class TestProblemRules(unittest.TestCase):
         self.assertEqual(b.propose(0).key, p.key)
         self.assertEqual(self.seen[-1].seed, v.seed)  # deterministic per (seed, agent, round)
 
+    def test_the_view_carries_the_region_and_the_descriptors(self):
+        a = agency(self.problem, extra_rules=("lowx1",))
+        a.set_campaign(parts_design(a.space, [({"x1": (0.1, 0.6)}, "lowx1", 3)]), 0)
+        step(a, 0)
+        a.complete(a.propose(1), Outcome(score=-1.0), 1)  # a failed run: no descriptor
+        a.propose(2)
+        v = self.seen[-1]
+        self.assertIs(v.region, a.campaign.region)
+        self.assertEqual(v.region.bounds["x1"], (0.1, 0.6))
+        self.assertEqual(v.own_descriptors.shape, (len(v.own_X), 3))
+        np.testing.assert_allclose(v.own_descriptors[0], a._desc[0])
+        self.assertTrue(np.isnan(v.own_descriptors[1]).all())  # row-aligned: the failed run is a NaN row
+        np.testing.assert_allclose(v.known_descriptors, a._descriptors())
+        self.assertIsNone(v.progress)  # the agent does not know the run's budget; the driver may
+
     def test_a_rule_that_breaks_falls_back_to_explore(self):
         for name, why in (("boom", "ZeroDivisionError"), ("short", "shape"), ("absent", "supplies no rule")):
             with self.subTest(rule=name):
