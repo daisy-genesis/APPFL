@@ -250,6 +250,8 @@ def run(
                 flush=True,
             )
 
+    for a in agents:  # follow-ups still open are closed on what is known (none without agency)
+        a.finish(cfg.rounds)
     record = _finish(problem, cfg, topo, agents, rounds, planner, time.time() - t0)
     if out:
         _write(Path(out), record, rounds, agents)
